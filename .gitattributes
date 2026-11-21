@@ -1,2 +1,6 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Windows batch files must keep CRLF line endings (also inside GitHub's "Download ZIP"), or cmd.exe can misread them
+*.bat text eol=crlf
+*.sh  text eol=lf
