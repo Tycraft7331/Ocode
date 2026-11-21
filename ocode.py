@@ -69,6 +69,7 @@ import importlib.util
 import io
 import secrets
 import webbrowser
+import getpass
 import json
 import os
 import platform
@@ -112,7 +113,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.4.2"
+VERSION = "4.5.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -255,6 +256,8 @@ DEFAULTS = {
     "recent_models": [],         # newest first, for F2
     "seen_version": "",          # to show "what's new" once after an update
     "show_highlights": True,
+    "welcome": True,             # the big welcome message on the home screen
+    "user_name": "",             # what ocode calls you ("" = your computer user name)
     "telegram_autostart": False,
     "telegram_owner": 0,          # the Telegram user id paired with this ocode
     "telegram_owner_name": "",
@@ -310,6 +313,165 @@ def greeting_text():
     hello = ("Good morning" if 5 <= h < 12 else "Good afternoon" if 12 <= h < 17 else
              "Good evening" if 17 <= h < 22 else "Burning the midnight oil?")
     return Text.assemble((hello, f"bold {FG2}"), ("  ·  what are we building today?", MUTED), justify="center")
+
+
+# ---------------------------------------------------------------------------
+# Welcome message (a smaller pixel font, drawn with half blocks: 5 pixels tall -> 3 rows)
+# ---------------------------------------------------------------------------
+BIG3 = {
+    "A": [".#.", "#.#", "###", "#.#", "#.#"], "B": ["##.", "#.#", "##.", "#.#", "##."],
+    "C": [".##", "#..", "#..", "#..", ".##"], "D": ["##.", "#.#", "#.#", "#.#", "##."],
+    "E": ["###", "#..", "##.", "#..", "###"], "F": ["###", "#..", "##.", "#..", "#.."],
+    "G": [".##", "#..", "#.#", "#.#", ".##"], "H": ["#.#", "#.#", "###", "#.#", "#.#"],
+    "I": ["###", ".#.", ".#.", ".#.", "###"], "J": ["..#", "..#", "..#", "#.#", ".#."],
+    "K": ["#.#", "#.#", "##.", "#.#", "#.#"], "L": ["#..", "#..", "#..", "#..", "###"],
+    "M": ["#...#", "##.##", "#.#.#", "#...#", "#...#"], "N": ["#..#", "##.#", "#.##", "#..#", "#..#"],
+    "O": [".#.", "#.#", "#.#", "#.#", ".#."], "P": ["##.", "#.#", "##.", "#..", "#.."],
+    "Q": [".#.", "#.#", "#.#", "##.", ".##"], "R": ["##.", "#.#", "##.", "#.#", "#.#"],
+    "S": [".##", "#..", ".#.", "..#", "##."], "T": ["###", ".#.", ".#.", ".#.", ".#."],
+    "U": ["#.#", "#.#", "#.#", "#.#", "###"], "V": ["#.#", "#.#", "#.#", "#.#", ".#."],
+    "W": ["#...#", "#...#", "#.#.#", "##.##", "#...#"], "X": ["#.#", "#.#", ".#.", "#.#", "#.#"],
+    "Y": ["#.#", "#.#", ".#.", ".#.", ".#."], "Z": ["###", "..#", ".#.", "#..", "###"],
+    "0": ["###", "#.#", "#.#", "#.#", "###"], "1": [".#.", "##.", ".#.", ".#.", "###"],
+    "2": ["##.", "..#", ".#.", "#..", "###"], "3": ["##.", "..#", ".#.", "..#", "##."],
+    "4": ["#.#", "#.#", "###", "..#", "..#"], "5": ["###", "#..", "##.", "..#", "##."],
+    "6": [".##", "#..", "###", "#.#", "###"], "7": ["###", "..#", ".#.", ".#.", ".#."],
+    "8": ["###", "#.#", "###", "#.#", "###"], "9": ["###", "#.#", "###", "..#", "##."],
+    "!": ["#", "#", "#", ".", "#"], ",": [".", ".", ".", "#", "#"], ".": [".", ".", ".", ".", "#"],
+    "'": ["#", "#", ".", ".", "."], "?": ["##.", "..#", ".#.", "...", ".#."], "-": ["...", "...", "###", "...", "..."],
+    " ": ["..", "..", "..", "..", ".."],
+}
+
+
+def big3_width(text, full=False):
+    px = sum(len(BIG3.get(ch, BIG3["?"])[0]) + 1 for ch in text.upper()) - 1 if text else 0
+    return px * 2 if full else px
+
+
+def big3_full(text, colors=None):
+    """Big version: every pixel is a square "██", 5 rows tall - the same size as the logo."""
+    text = text.upper()
+    rows = ["", "", "", "", ""]
+    for i, ch in enumerate(text):
+        g = BIG3.get(ch, BIG3["?"])
+        for r in range(5):
+            rows[r] += g[r] + ("." if i < len(text) - 1 else "")
+    width = len(rows[0])
+    t = Text(no_wrap=True)
+    for r, row in enumerate(rows):
+        for x, px in enumerate(row):
+            if px == "#":
+                t.append("██", style=_hex(gradient_at(colors or GRAD, x / max(width - 1, 1))))
+            else:
+                t.append("  ")
+        if r < 4:
+            t.append("\n")
+    return t
+
+
+def wrap_big(text, width, max_lines=2):
+    """Split a message into at most max_lines lines that each fit `width` columns in the big font."""
+    lines, cur = [], ""
+    for word in text.split(" "):
+        trial = f"{cur} {word}" if cur else word
+        if big3_width(trial, full=True) <= width:
+            cur = trial
+        else:
+            if not cur or big3_width(word, full=True) > width:
+                return None
+            lines.append(cur)
+            cur = word
+    lines.append(cur)
+    return lines if len(lines) <= max_lines else None
+
+
+def big3(text, colors=None):
+    """Text in the small pixel font, 3 terminal rows tall, coloured with the logo gradient."""
+    text = text.upper()
+    rows = ["", "", "", "", "", ""]
+    for i, ch in enumerate(text):
+        g = BIG3.get(ch, BIG3["?"])
+        for r in range(6):
+            rows[r] += (g[r] if r < 5 else "." * len(g[0])) + ("." if i < len(text) - 1 else "")
+    width = len(rows[0])
+    t = Text(no_wrap=True)
+    for line in range(3):
+        top, bot = rows[line * 2], rows[line * 2 + 1]
+        for x in range(width):
+            a, b = top[x] == "#", bot[x] == "#"
+            ch = "█" if a and b else "▀" if a else "▄" if b else " "
+            if ch == " ":
+                t.append(" ")
+            else:
+                t.append(ch, style=_hex(gradient_at(colors or GRAD, x / max(width - 1, 1))))
+        if line < 2:
+            t.append("\n")
+    return t
+
+
+GENERIC_USERS = {"user", "admin", "administrator", "root", "owner", "pc", "default", "guest", "home", "me"}
+
+
+def display_name(cfg):
+    name = (cfg.get("user_name") or "").strip()
+    if name:
+        return name
+    try:
+        login = getpass.getuser()
+    except Exception:
+        login = ""
+    login = re.split(r"[._\-\s@]", login or "")[0]
+    if not login or login.lower() in GENERIC_USERS or not re.fullmatch(r"[A-Za-z][A-Za-z']{0,19}", login):
+        return ""
+    return login[:1].upper() + login[1:]
+
+
+def welcome_block(cfg, width=100, first=False, compact=False, height=40):
+    """The big welcome message on the home screen."""
+    now = datetime.datetime.now()
+    h = now.hour
+    hello = ("Good morning" if 5 <= h < 12 else "Good afternoon" if 12 <= h < 17 else
+             "Good evening" if 17 <= h < 22 else "Burning the midnight oil?")
+    name = display_name(cfg)
+    hour = now.strftime("%I").lstrip("0") or "12"
+    when = f"{now.strftime('%A')}, {now.strftime('%B')} {now.day}  ·  {hour}:{now.strftime('%M %p')}"
+    parts = []
+    if not compact:
+        options = ([f"Welcome, {name}!", "Welcome!"] if first else
+                   [f"Welcome back, {name}!", f"Hi, {name}!", "Welcome back!", "Welcome!"])
+        options = [o for o in options if name or "{" not in o and ", !" not in o]
+        options = [o.replace(", !", "!") for o in options]
+        tall = height >= 40
+        for o in options:
+            lines = wrap_big(o, width - 2, max_lines=2 if tall else 1)
+            if lines:
+                for i, ln in enumerate(lines):
+                    if i:
+                        parts.append(Text(""))
+                    parts.append(Align.center(big3_full(ln)))
+                parts.append(Text(""))
+                break
+        else:
+            small = next((o for o in options if big3_width(o) <= width - 2), None)
+            if small:
+                parts.append(Align.center(big3(small)))
+                parts.append(Text(""))
+    if parts:
+        parts.insert(0, Text(""))
+    else:
+        parts.append(Align.center(Text(f"{'Welcome' if first else 'Welcome back'}{', ' + name if name else ''}!",
+                                       style=f"bold {FG}", justify="center")))
+    line = Text(justify="center")
+    line.append(hello + ("" if hello.endswith("?") else "."), style=f"bold {FG2}")
+    line.append(f"   {when}", style=MUTED)
+    parts.append(Align.center(line))
+    if first:
+        parts.append(Align.center(Text.assemble(
+            ("New here? ", f"bold {ACCENT}"), ("Just start typing  ·  ", MUTED), ("F1", f"bold {FG2}"),
+            (" help  ·  ", MUTED), ("ctrl+p", f"bold {FG2}"), (" all commands", MUTED), justify="center")))
+    else:
+        parts.append(Align.center(Text("What are we building today?", style=MUTED, justify="center")))
+    return Group(*parts)
 
 
 def theme_preview():
@@ -2493,11 +2655,15 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
     "screen": "screenshot look see", "listen": "mic microphone talk voice speech", "speak": "voice tts audio",
     "voice": "mic microphone speech", "memory": "remember facts", "remember": "memory fact",
     "update": "upgrade new version github latest", "model": "ollama llm", "theme": "colour color dark light", "randomtheme": "colour color surprise",
-    "logo": "gradient banner", "animations": "shimmer motion cursor", "settings": "options preferences config host",
+    "logo": "gradient banner", "welcome": "greeting hello banner home", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
 }
 
 
 WHATS_NEW = {
+    "4.5.0": [
+        ("Welcome", "A big welcome message on the home screen with your name, the time and the date. "
+                    "/name changes what ocode calls you, /welcome turns it off."),
+    ],
     "4.4.2": [
         ("Knows the date", "The AI now always knows today's date, the day of the week, the time and your time zone."),
     ],
@@ -3341,6 +3507,8 @@ HELP_TOPICS = [
      f"{len(PALETTES)} themes with a live preview, applied instantly. Your choice is remembered.",
      [("/theme [name]", "pick a theme with live preview - e.g. dracula, catppuccin, nord, solarized, synthwave, matrix"),
       ("/theme random", "surprise me"),
+      ("/welcome [on|off]", "the big welcome message on the home screen"),
+      ("/name [your name]", "what ocode calls you in the welcome"),
       ("l  /  a  /  r", "in the theme picker: cycle the logo style, turn animations on/off, random theme"),
       ("ctrl+p", "command palette"),
       ("click a tool card", "expand its full output or diff")]),
@@ -5694,7 +5862,7 @@ class OcodeApp(App):
     #stage { width: 100%; height: 1fr; align: center middle; }
     #stage.chatting { align: left top; }
     #logo { width: 100%; height: auto; margin-bottom: 1; }
-    #subtitle { width: 100%; height: 1; margin-bottom: 1; }
+    #subtitle { width: 100%; height: auto; margin-bottom: 1; }
     #stage.chatting #subtitle { display: none; }
     #stage.chatting #logo { display: none; }
     #tabbar { width: 100%; height: 1; margin-top: 1; }
@@ -5894,7 +6062,7 @@ class OcodeApp(App):
             yield TabBar()
             with Vertical(id="stage"):
                 yield Static(Align.center(build_logo()), id="logo")
-                yield Static(Align.center(greeting_text()), id="subtitle")
+                yield Static(self.welcome_render(), id="subtitle")
                 yield self.cur_tab.view
                 with Vertical(id="promptbox"):
                     yield AttachBar()
@@ -5928,6 +6096,8 @@ class OcodeApp(App):
             self.telegram.start()
         self.note_recent_model(self.cfg.get("model"), save=False)
         seen = self.cfg.get("seen_version") or ""
+        self.first_launch = not seen
+        self.refresh_welcome()
         if seen != VERSION:
             self.cfg["seen_version"] = VERSION
             save_settings(self.cfg)
@@ -6068,6 +6238,25 @@ class OcodeApp(App):
         if save:
             save_settings(self.cfg)
 
+    def welcome_render(self):
+        if not self.cfg.get("welcome", True):
+            return Align.center(greeting_text())
+        try:
+            w, h = self.size.width, self.size.height
+        except Exception:
+            w, h = 100, 40
+        width = min(w, 100) - 4
+        return welcome_block(self.cfg, width, first=getattr(self, "first_launch", False), compact=h < 30, height=h)
+
+    def refresh_welcome(self):
+        try:
+            self.query_one("#subtitle", Static).update(self.welcome_render())
+        except Exception:
+            pass
+
+    def on_resize(self, event):
+        self.refresh_welcome()
+
     def animate_logo(self):
         """A soft band of light sweeps across the logo every few seconds on the home screen."""
         if not self.cfg.get("animations", True):
@@ -6100,7 +6289,7 @@ class OcodeApp(App):
         """Re-draw everything that has colours baked into it."""
         try:
             self.query_one("#logo", Static).update(Align.center(build_logo()))
-            self.query_one("#subtitle", Static).update(Align.center(greeting_text()))
+            self.refresh_welcome()
             for tab in self.tabs:
                 for card in tab.view.query(ToolCard):
                     card.refresh_card()
@@ -6161,6 +6350,10 @@ class OcodeApp(App):
 
     def _tick(self):
         self.animate_logo()
+        minute = time.localtime().tm_min
+        if minute != getattr(self, "_welcome_min", None):
+            self._welcome_min = minute
+            self.refresh_welcome()
         state = (self.busy, self.listening, self.transcribing, self.speaker.speaking,
                  tuple((t.busy, t.unread, t.attention) for t in self.tabs), self.discord.status)
         if state != self._last_state:
@@ -8238,6 +8431,26 @@ class OcodeApp(App):
             self.copy_last_reply()
         elif cmd == "/undo":
             self.undo_last()
+        elif cmd == "/name":
+            if arg.strip():
+                self.cfg["user_name"] = arg.strip()[:30]
+                save_settings(self.cfg)
+                self.refresh_welcome()
+                self.notify(f"Nice to meet you, {self.cfg['user_name']}!", title="Name saved")
+            else:
+                def got(v):
+                    if v is not None:
+                        self.cfg["user_name"] = v.strip()[:30]
+                        save_settings(self.cfg)
+                        self.refresh_welcome()
+                self.push_screen(InputScreen("What should ocode call you? (empty = your computer name)",
+                                             self.cfg.get("user_name") or display_name(self.cfg)), got)
+        elif cmd == "/welcome":
+            want = {"on": True, "off": False}.get(arg.strip().lower(), not self.cfg.get("welcome", True))
+            self.cfg["welcome"] = want
+            save_settings(self.cfg)
+            self.refresh_welcome()
+            self.notify(f"Welcome message {'on' if want else 'off'}.", timeout=2)
         elif cmd in ("/connections", "/connect", "/integrations"):
             self.open_connections()
         elif cmd in ("/mcp", "/mcps"):
@@ -8449,6 +8662,8 @@ class OcodeApp(App):
             ("theme", "Model & look", "Change theme…", "", PALETTES[c["theme"]]["label"]),
             ("randomtheme", "Model & look", "Random theme", "", ""),
             ("logo", "Model & look", "Logo style", "", c["logo_style"]),
+            ("welcome", "Model & look", "Welcome message", "", "on" if c.get("welcome", True) else "off"),
+            ("name", "Model & look", "Your name…", "", display_name(c) or "not set"),
             ("animations", "Model & look", "Animations", "", onoff(c["animations"])),
             ("settings", "Model & look", "Settings…", "", "host, temperature, context"),
         ]
@@ -8534,6 +8749,10 @@ class OcodeApp(App):
                 self.push_screen(ThemeScreen())
             elif cid == "randomtheme":
                 self.slash("/theme random")
+            elif cid == "welcome":
+                self.slash("/welcome")
+            elif cid == "name":
+                self.slash("/name")
             elif cid == "logo":
                 self.set_logo_style(LOGO_STYLES[(LOGO_STYLES.index(self.cfg["logo_style"]) + 1) % len(LOGO_STYLES)])
                 self.notify(f"Logo style: {self.cfg['logo_style']}", timeout=2)
