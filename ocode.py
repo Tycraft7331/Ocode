@@ -111,7 +111,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -1903,6 +1903,13 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
 
 
 WHATS_NEW = {
+    "4.3.0": [
+        ("A fresh coat of paint", "Framed dialogs, colored on/off switches, keycap hints and calmer list highlights everywhere."),
+        ("Reply footers", "Each answer ends with which mode and model replied, how long it took and how fast it was."),
+        ("Clearer tool results", "✓ / ✗ marks on every action, and \"N more lines\" instead of a wall of output."),
+        ("Permission prompts", "Now framed in yellow and worded plainly, so you can't miss when ocode needs you."),
+        ("Themed notifications", "Pop-ups match your theme, with a colored edge for info, warnings and errors."),
+    ],
     "4.2.0": [
         ("/undo  /redo", "Undo now takes back your whole last message - the reply and every file change - and puts "
                          "your text back in the prompt to edit. /redo brings it all back."),
@@ -1966,6 +1973,49 @@ def highlight_matches(title, query, base_style, hit_style):
     return t
 
 
+def keys_hint(*pairs, warn=None):
+    """A row of keycap-style hints:  enter select   esc close"""
+    if warn:
+        return Text(warn, style=f"bold {RED}")
+    t = Text()
+    for i, (key, label) in enumerate(pairs):
+        if i:
+            t.append("   ")
+        t.append(f" {key} ", style=f"bold {FG2} on {PANEL2}")
+        t.append(" " + label, style=MUTED)
+    return t
+
+
+def toggle_label(on):
+    """● on (green) / ○ off (dim) for switch buttons."""
+    return Text.assemble(("● ", GREEN), ("on", f"bold {FG}")) if on else Text.assemble(("○ ", MUTED), ("off", MUTED))
+
+
+def dialog_title(title, sub=""):
+    t = Text()
+    t.append("◆ ", style=ACCENT)
+    t.append(title, style=f"bold {FG}")
+    if sub:
+        t.append("   " + sub, style=MUTED)
+    return t
+
+
+def option_row(left, right="", marker=False, left_style=None):
+    """A list row: text on the left, details right-aligned."""
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+    grid.add_column(justify="right", no_wrap=True, overflow="ellipsis", max_width=40)
+    lt = left if isinstance(left, Text) else Text(left, style=left_style or f"bold {FG}")
+    grid.add_row(Text.assemble(("● " if marker else "  ", GREEN), lt),
+                 right if isinstance(right, Text) else Text(right, style=MUTED))
+    return grid
+
+
+def fmt_secs(sec):
+    sec = max(0, int(sec))
+    return f"{sec}s" if sec < 60 else f"{sec // 60}m {sec % 60:02d}s"
+
+
 class PaletteScreen(ModalScreen):
     """ctrl+p: every command, grouped and sorted A-Z. Type to search - the best match comes first."""
     BINDINGS = [
@@ -1983,13 +2033,11 @@ class PaletteScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="palette"):
             with Horizontal(id="palette-head"):
-                yield Static(Text("Commands", style="bold"), id="palette-title")
+                yield Static(dialog_title("Commands"), id="palette-title")
                 yield Static("", id="palette-count")
             yield Input(placeholder="Type to search commands…", id="palette-input")
             yield OptionList(id="palette-list")
-            yield Static(Text.assemble(("↑↓", f"bold {FG2}"), (" move   ", MUTED), ("enter", f"bold {FG2}"),
-                                       (" run   ", MUTED), ("esc", f"bold {FG2}"), (" close", MUTED)),
-                         id="palette-foot")
+            yield Static(keys_hint(("↑↓", "move"), ("enter", "run"), ("esc", "close")), id="palette-foot")
 
     def on_mount(self):
         self.refill("")
@@ -2085,9 +2133,9 @@ class ModelScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static(Text("Select model", style="bold"), classes="title")
+            yield Static(dialog_title("Choose a model", "installed in Ollama"), classes="title")
             yield OptionList(id="model-list")
-            yield Static(Text("enter select  ·  r rescan  ·  esc close", style=MUTED), classes="hint")
+            yield Static(keys_hint(("enter", "use it"), ("r", "rescan"), ("esc", "close")), classes="hint")
 
     def on_mount(self):
         self.action_rescan()
@@ -2121,12 +2169,8 @@ class ModelScreen(ModalScreen):
             return
         active = self.app.cfg["model"]
         for i, m in enumerate(models):
-            t = Text()
-            t.append("● " if m["name"] == active else "  ", style=ACCENT)
-            t.append(m["name"], style="bold")
-            info = "  ".join(x for x in (m["params"], m["quant"], f"{m['size_gb']:.1f} GB") if x)
-            t.append("   " + info, style="dim")
-            ol.add_option(Option(t, id=m["name"]))
+            info = "  ·  ".join(x for x in (m["params"], m["quant"], f"{m['size_gb']:.1f} GB") if x)
+            ol.add_option(Option(option_row(m["name"], info, marker=m["name"] == active), id=m["name"]))
             if m["name"] == active:
                 ol.highlighted = i
         if ol.highlighted is None:
@@ -2151,9 +2195,9 @@ class ChoiceScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static(Text(self.title_text, style="bold"), classes="title")
+            yield Static(dialog_title(self.title_text), classes="title")
             yield OptionList(id="choice-list")
-            yield Static(Text("enter select  ·  esc cancel", style=MUTED), classes="hint")
+            yield Static(keys_hint(("enter", "select"), ("esc", "cancel")), classes="hint")
 
     def on_mount(self):
         ol = self.query_one(OptionList)
@@ -2177,12 +2221,7 @@ class ChoiceScreen(ModalScreen):
             ol.add_option(Option(Text(err or "Nothing found.", style="red"), disabled=True))
             return
         for i, (oid, label, hint) in enumerate(opts):
-            t = Text()
-            t.append("● " if oid == self.current else "  ", style=ACCENT)
-            t.append(label, style="bold")
-            if hint:
-                t.append("   " + hint, style="dim")
-            ol.add_option(Option(t, id=oid))
+            ol.add_option(Option(option_row(label, hint or "", marker=oid == self.current), id=oid))
             if oid == self.current:
                 ol.highlighted = i
         if ol.highlighted is None:
@@ -2203,7 +2242,7 @@ class SettingsScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         c = self.app.cfg
         with VerticalScroll(id="dialog"):
-            yield Static(Text("Settings", style="bold"), classes="title")
+            yield Static(dialog_title("Settings"), classes="title")
             with Horizontal(classes="row"):
                 yield Static("Model", classes="rowlabel")
                 yield Button(c["model"] or "(none) - press to choose", id="btn-model")
@@ -2218,16 +2257,16 @@ class SettingsScreen(ModalScreen):
                 yield Input(str(c["num_ctx"]), id="in-ctx")
             with Horizontal(classes="row"):
                 yield Static("Auto-approve edits", classes="rowlabel")
-                yield Button("ON" if c["auto_approve"] else "off", id="btn-auto")
+                yield Button(toggle_label(c["auto_approve"]), id="btn-auto")
             with Horizontal(classes="row"):
                 yield Static("Auto-memory", classes="rowlabel")
-                yield Button("ON" if c["auto_memory"] else "off", id="btn-automem")
+                yield Button(toggle_label(c["auto_memory"]), id="btn-automem")
             with Horizontal(classes="row"):
                 yield Button("Voice & microphone…", id="btn-voice")
                 yield Button("View memory…", id="btn-memory")
             with Horizontal(classes="row"):
                 yield Button("Google & screen…", id="btn-google")
-            yield Static(Text("esc  save & close", style=MUTED), classes="hint")
+            yield Static(keys_hint(("esc", "save & close")), classes="hint")
 
     @on(Button.Pressed, "#btn-model")
     def _pick_model(self):
@@ -2241,7 +2280,7 @@ class SettingsScreen(ModalScreen):
     def _toggle(self, key, btn):
         c = self.app.cfg
         c[key] = not c[key]
-        self.query_one(btn, Button).label = "ON" if c[key] else "off"
+        self.query_one(btn, Button).label = toggle_label(c[key])
 
     @on(Button.Pressed, "#btn-auto")
     def _a(self):
@@ -2286,10 +2325,10 @@ class VoiceScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         c = self.app.cfg
         with VerticalScroll(id="dialog"):
-            yield Static(Text("Voice & microphone", style="bold"), classes="title")
+            yield Static(dialog_title("Voice & microphone"), classes="title")
             with Horizontal(classes="row"):
                 yield Static("Speak replies", classes="rowlabel")
-                yield Button("ON" if c["speak"] else "off", id="btn-speak")
+                yield Button(toggle_label(c["speak"]), id="btn-speak")
             with Horizontal(classes="row"):
                 yield Static("Voice", classes="rowlabel")
                 yield Button(c["voice"] or "Auto (male voice)", id="btn-voicepick")
@@ -2304,16 +2343,16 @@ class VoiceScreen(ModalScreen):
                 yield Button(c["stt_model"], id="btn-stt")
             with Horizontal(classes="row"):
                 yield Static("Auto-send when done", classes="rowlabel")
-                yield Button("ON" if c["auto_send"] else "off", id="btn-send")
+                yield Button(toggle_label(c["auto_send"]), id="btn-send")
             with Horizontal(classes="row"):
                 yield Button("Test voice", id="btn-test")
             yield Static(Text("Talk with ctrl+r.  Needs: " + MIC_HELP, style=MUTED), classes="hint")
-            yield Static(Text("esc  save & close", style=MUTED))
+            yield Static(keys_hint(("ctrl+r", "talk"), ("esc", "save & close")), classes="hint")
 
     def _toggle(self, key, btn):
         c = self.app.cfg
         c[key] = not c[key]
-        self.query_one(btn, Button).label = "ON" if c[key] else "off"
+        self.query_one(btn, Button).label = toggle_label(c[key])
 
     @on(Button.Pressed, "#btn-speak")
     def _a(self):
@@ -2379,7 +2418,7 @@ class GoogleScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         c = self.app.cfg
         with VerticalScroll(id="dialog"):
-            yield Static(Text("Google", style="bold"), classes="title")
+            yield Static(dialog_title("Google & screen"), classes="title")
             with Horizontal(classes="row"):
                 yield Static("Google account", classes="rowlabel")
                 yield Button("", id="btn-gaccount")
@@ -2389,7 +2428,7 @@ class GoogleScreen(ModalScreen):
             for key, label in self.TOGGLES:
                 with Horizontal(classes="row"):
                     yield Static(label, classes="rowlabel")
-                    yield Button("ON" if c[key] else "off", id="btn-" + key)
+                    yield Button(toggle_label(c[key]), id="btn-" + key)
             yield Static(Text("Screen viewing", style="bold"), classes="title subtitle")
             with Horizontal(classes="row"):
                 yield Static("Vision model", classes="rowlabel")
@@ -2398,7 +2437,7 @@ class GoogleScreen(ModalScreen):
                 yield Static("Capture delay (sec)", classes="rowlabel")
                 yield Input(str(c["screen_delay"]), id="in-delay")
             yield Static("", id="g-help", classes="hint")
-            yield Static(Text("Try it: press ctrl+g.   esc  save & close", style=MUTED), classes="hint")
+            yield Static(keys_hint(("ctrl+g", "look at my screen"), ("esc", "save & close")), classes="hint")
 
     def on_mount(self):
         self.refresh_labels()
@@ -2452,7 +2491,7 @@ class GoogleScreen(ModalScreen):
         if bid.startswith("btn-google_"):
             key = bid[4:]
             self.app.cfg[key] = not self.app.cfg[key]
-            e.button.label = "ON" if self.app.cfg[key] else "off"
+            e.button.label = toggle_label(self.app.cfg[key])
 
     @on(Button.Pressed, "#btn-vision")
     def _vision(self):
@@ -2483,7 +2522,7 @@ class DiscordScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         c = self.app.cfg
         with VerticalScroll(id="dialog"):
-            yield Static(Text("Discord bot", style="bold"), classes="title")
+            yield Static(dialog_title("Discord bot"), classes="title")
             with Horizontal(classes="row"):
                 yield Static("Status", classes="rowlabel")
                 yield Button("", id="btn-dstatus")
@@ -2492,7 +2531,7 @@ class DiscordScreen(ModalScreen):
                 yield Input(placeholder="paste the token, press enter", password=True, id="in-dtoken")
             with Horizontal(classes="row"):
                 yield Static("Connect on startup", classes="rowlabel")
-                yield Button("ON" if c["discord_autostart"] else "off", id="btn-dauto")
+                yield Button(toggle_label(c["discord_autostart"]), id="btn-dauto")
             with Horizontal(classes="row"):
                 yield Static("Who can talk to it", classes="rowlabel")
                 yield Button("", id="btn-deveryone")
@@ -2504,10 +2543,10 @@ class DiscordScreen(ModalScreen):
                 yield Button("", id="btn-dagent")
             with Horizontal(classes="row"):
                 yield Static("Use my memory there", classes="rowlabel")
-                yield Button("ON" if c["discord_memory"] else "off", id="btn-dmemory")
+                yield Button(toggle_label(c["discord_memory"]), id="btn-dmemory")
             yield Static("", id="d-help", classes="hint")
             yield Static(Text(DISCORD_SAFETY, style=MUTED), classes="hint")
-            yield Static(Text("esc  save & close", style=MUTED), classes="hint")
+            yield Static(keys_hint(("esc", "save & close")), classes="hint")
 
     def on_mount(self):
         self.refresh_labels()
@@ -2554,13 +2593,13 @@ class DiscordScreen(ModalScreen):
     def _auto(self, e):
         c = self.app.cfg
         c["discord_autostart"] = not c["discord_autostart"]
-        e.button.label = "ON" if c["discord_autostart"] else "off"
+        e.button.label = toggle_label(c["discord_autostart"])
 
     @on(Button.Pressed, "#btn-dmemory")
     def _mem(self, e):
         c = self.app.cfg
         c["discord_memory"] = not c["discord_memory"]
-        e.button.label = "ON" if c["discord_memory"] else "off"
+        e.button.label = toggle_label(c["discord_memory"])
 
     @on(Button.Pressed, "#btn-deveryone")
     def _everyone(self):
@@ -2747,10 +2786,10 @@ class HelpScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="wide"):
-            yield Static(Text("Help", style="bold"), classes="title")
+            yield Static(dialog_title("Help", "every command and shortcut"), classes="title")
             yield Input(self.initial_query, placeholder="Search commands, shortcuts and topics…", id="help-input")
             yield OptionList(id="help-list")
-            yield Static(Text("↑↓ browse  ·  enter on a /command types it for you  ·  esc close", style=MUTED), classes="hint")
+            yield Static(keys_hint(("↑↓", "browse"), ("enter", "type the /command for me"), ("esc", "close")), classes="hint")
 
     def on_mount(self):
         self.refill(self.initial_query)
@@ -2823,12 +2862,11 @@ class FilePickerScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="picker"):
             with Horizontal(id="palette-head"):
-                yield Static(Text("Find a file", style="bold"), id="palette-title")
+                yield Static(dialog_title("Find a file"), id="palette-title")
                 yield Static("", id="palette-count")
             yield Input(self.initial, placeholder="Type part of a file name…", id="picker-input")
             yield OptionList(id="picker-list")
-            yield Static(Text.assemble(("enter", f"bold {FG2}"), (" insert @file   ", MUTED), ("esc", f"bold {FG2}"),
-                                       (" close", MUTED)), classes="hint")
+            yield Static(keys_hint(("enter", "insert @file"), ("esc", "close")), classes="hint")
 
     def on_mount(self):
         self.query_one("#picker-list", OptionList).add_option(Option(Text("Looking through the project…", style=MUTED),
@@ -2910,7 +2948,7 @@ class SessionsScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="picker"):
             with Horizontal(id="palette-head"):
-                yield Static(Text("Sessions", style="bold"), id="palette-title")
+                yield Static(dialog_title("Sessions"), id="palette-title")
                 yield Static("", id="palette-count")
             yield Input(placeholder="Search your past chats…", id="sessions-input")
             yield OptionList(id="sessions-list")
@@ -2950,12 +2988,8 @@ class SessionsScreen(ModalScreen):
         self.set_hint()
 
     def set_hint(self, warn=None):
-        k = lambda key, label: [(key, f"bold {FG2}"), (" " + label + "   ", MUTED)]
-        if warn:
-            self.query_one("#sessions-hint", Static).update(Text(warn, style=f"bold {RED}"))
-        else:
-            self.query_one("#sessions-hint", Static).update(Text.assemble(
-                *k("enter", "open"), *k("ctrl+d", "delete"), *k("●", "open in a tab"), *k("esc", "close")))
+        self.query_one("#sessions-hint", Static).update(keys_hint(
+            ("enter", "open"), ("ctrl+d", "delete"), ("●", "already open"), ("esc", "close"), warn=warn))
 
     @on(Input.Changed, "#sessions-input")
     def _changed(self, e):
@@ -3015,12 +3049,11 @@ class BtwScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="btw"):
-            yield Static(Text.assemble(("By the way  ", "bold"), ("(not added to the chat)", MUTED)), classes="title")
+            yield Static(dialog_title("By the way", "not added to the chat"), classes="title")
             yield Static(Text.assemble(("┃ ", ACCENT), (self.question, FG), style=f"on {PANEL2}"), id="btw-q")
             with VerticalScroll(id="btw-scroll"):
                 yield Static(Text("thinking…", style=MUTED), id="btw-answer")
-            yield Static(Text.assemble(("c", f"bold {FG2}"), (" copy answer   ", MUTED), ("esc", f"bold {FG2}"),
-                                       (" close", MUTED)), classes="hint")
+            yield Static(keys_hint(("c", "copy answer"), ("esc", "close")), classes="hint")
 
     def on_mount(self):
         self.app.run_worker(lambda: self.app.btw_worker(self, self.question, self.tab), thread=True, exit_on_error=False)
@@ -3045,21 +3078,32 @@ class HighlightsScreen(ModalScreen):
     """What's new in this version (shown once after an update, or with /highlights)."""
     BINDINGS = [Binding("escape", "close", "Close"), Binding("enter", "close", show=False)]
 
+    def __init__(self, since=""):
+        super().__init__()
+        self.since = since
+
     def compose(self) -> ComposeResult:
-        ver = VERSION if VERSION in WHATS_NEW else (sorted(WHATS_NEW, key=parse_version)[-1] if WHATS_NEW else VERSION)
+        newest_first = sorted(WHATS_NEW, key=parse_version, reverse=True)
+        if self.since:  # everything you haven't seen yet
+            versions = [v for v in newest_first if parse_version(self.since) < parse_version(v) <= parse_version(VERSION)]
+        else:
+            versions = [v for v in newest_first if parse_version(v) <= parse_version(VERSION)][:2]
+        versions = versions or newest_first[:1]
         with Vertical(id="dialog", classes="btw"):
-            yield Static(Text.assemble(("What's new in ocode ", "bold"), (ver, f"bold {ACCENT}")), classes="title")
+            yield Static(dialog_title(f"What's new in ocode {VERSION}"), classes="title")
             body = Table.grid(padding=(0, 2))
             body.add_column(no_wrap=True, style=f"bold {FG}")
             body.add_column(ratio=1, style=FG2)
-            for key, desc in WHATS_NEW.get(ver, []):
-                body.add_row(key, desc)
-                body.add_row("", "")
+            for i, ver in enumerate(versions):
+                if len(versions) > 1:
+                    body.add_row(Text(("" if i == 0 else "\n") + f"Version {ver}", style=f"bold {ACCENT}"), "")
+                for key, desc in WHATS_NEW.get(ver, []):
+                    body.add_row(key, desc)
+                    body.add_row("", "")
             with VerticalScroll(id="btw-scroll"):
                 yield Static(body)
-            yield Static(Text.assemble(("enter", f"bold {FG2}"), (" close   ", MUTED), ("F1", f"bold {FG2}"),
-                                       (" all commands   ", MUTED), ("/highlights", f"bold {FG2}"),
-                                       (" shows this again", MUTED)), classes="hint")
+            yield Static(keys_hint(("enter", "close"), ("F1", "all commands"), ("/highlights", "show this again")),
+                         classes="hint")
 
     def action_close(self):
         self.dismiss(None)
@@ -3073,7 +3117,7 @@ class ThemeScreen(ModalScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog", classes="themes"):
             with Horizontal(id="theme-head"):
-                yield Static(Text("Theme", style="bold"), id="theme-title")
+                yield Static(dialog_title("Theme"), id="theme-title")
                 yield Static(Text(f"{len(PALETTES)} themes", style=MUTED, justify="right"), id="theme-count")
             with Horizontal(id="theme-body"):
                 yield OptionList(id="theme-list")
@@ -3105,10 +3149,9 @@ class ThemeScreen(ModalScreen):
     def refresh_preview(self):
         self.query_one("#theme-preview", Static).update(theme_preview())
         c = self.app.cfg
-        k = lambda key, label: [(key, f"bold {FG2}"), (" " + label + "   ", MUTED)]
-        self.query_one("#theme-hint", Static).update(Text.assemble(
-            *k("↑↓", "preview"), *k("enter", "keep"), *k("l", f"logo: {c['logo_style']}"),
-            *k("a", f"animations: {'on' if c['animations'] else 'off'}"), *k("r", "random"), *k("esc", "cancel")))
+        self.query_one("#theme-hint", Static).update(keys_hint(
+            ("↑↓", "preview"), ("enter", "keep"), ("l", f"logo: {c['logo_style']}"),
+            ("a", f"animations {'on' if c['animations'] else 'off'}"), ("r", "random"), ("esc", "cancel")))
 
     @on(OptionList.OptionHighlighted)
     def _highlighted(self, e):
@@ -3159,7 +3202,7 @@ class MemoryScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static(Text("Memory", style="bold"), classes="title")
+            yield Static(dialog_title("Memory", "what ocode remembers"), classes="title")
             yield Static("", id="mem-summary")
             yield OptionList(id="mem-list")
             yield Static("", id="mem-hint", classes="hint")
@@ -3174,14 +3217,13 @@ class MemoryScreen(ModalScreen):
         ol.clear_options()
         facts = mem.all()
         for f in facts:
-            t = Text()
+            t = Text(no_wrap=True, overflow="ellipsis")
             if f["scope"] == "project":
-                t.append(f"[{Path(f.get('project') or '?').name or 'project'}] ", style=YELLOW)
+                t.append(f" {Path(f.get('project') or '?').name or 'project'} ", style=f"{BG} on {YELLOW}")
             else:
-                t.append("[you] ", style=CYAN)
-            t.append(f["text"])
-            t.append("   " + time.strftime("%b %d", time.localtime(f["created"])), style="dim")
-            ol.add_option(Option(t, id=f["id"]))
+                t.append(" you ", style=f"{BG} on {CYAN}")
+            t.append("  " + f["text"], style=FG)
+            ol.add_option(Option(option_row(t, time.strftime("%b %d", time.localtime(f["created"]))), id=f["id"]))
         if not facts:
             ol.add_option(Option(Text("Nothing remembered yet. Just talk to me, or press a to add a memory.",
                                       style="dim"), disabled=True))
@@ -3192,9 +3234,9 @@ class MemoryScreen(ModalScreen):
         sw.display = bool(summary)
         sw.update(Text("This session so far: " + summary[:350] + ("…" if len(summary) > 350 else ""), style=MUTED)
                   if summary else "")
-        hint = ("press c again to ERASE ALL memories" if self._confirm_clear else
-                "d delete  ·  a add  ·  p add project note  ·  c clear all  ·  esc close")
-        self.query_one("#mem-hint", Static).update(Text(hint, style=RED if self._confirm_clear else MUTED))
+        self.query_one("#mem-hint", Static).update(keys_hint(
+            ("d", "delete"), ("a", "add"), ("p", "project note"), ("c", "clear all"), ("esc", "close"),
+            warn="Press c again to ERASE ALL memories." if self._confirm_clear else None))
 
     def _current(self):
         ol = self.query_one(OptionList)
@@ -3255,14 +3297,18 @@ class ApprovalScreen(ModalScreen):
             body.append(line[:200] + ("\n" if i < len(shown) - 1 else ""), style=style)
         if len(lines) > 16:
             body.append(f"\n… {len(lines) - 16} more lines", style="dim")
-        with Vertical(id="dialog"):
-            yield Static(Text("Permission required", style=f"bold {YELLOW}"), classes="title")
-            yield Static(Text(self.title_text, style="bold"))
+        what, _, where = self.title_text.partition("      (tab ")
+        with Vertical(id="dialog", classes="warn"):
+            yield Static(Text.assemble(("⚠  ", f"bold {YELLOW}"), ("ocode wants to ", FG2), (what.strip(), f"bold {FG}")),
+                         classes="title")
+            if where:
+                yield Static(Text("from tab " + where.rstrip(")"), style=MUTED))
             yield Static(body, id="preview")
             with Horizontal(classes="buttons"):
-                yield Button("Allow (y)", id="yes")
-                yield Button("Always (a)", id="always")
-                yield Button("Deny (n)", id="no")
+                yield Button("Allow", id="yes")
+                yield Button("Always allow here", id="always")
+                yield Button("Deny", id="no")
+            yield Static(keys_hint(("y", "allow"), ("a", "always in this tab"), ("n", "deny")), classes="hint")
 
     @on(Button.Pressed)
     def _pressed(self, e):
@@ -3281,9 +3327,9 @@ class InputScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static(Text(self.title_text, style="bold"), classes="title")
+            yield Static(dialog_title(self.title_text), classes="title")
             yield Input(self.value, id="modal-input")
-            yield Static(Text("enter confirm  ·  esc cancel", style=MUTED), classes="hint")
+            yield Static(keys_hint(("enter", "confirm"), ("esc", "cancel")), classes="hint")
 
     @on(Input.Submitted)
     def _submitted(self, e):
@@ -3384,8 +3430,9 @@ class ToolCard(Static):
     def build(self):
         t = Text()
         color = {"ok": GREEN, "denied": YELLOW, "error": RED}.get(self.status, MUTED)
+        mark = {"ok": "✓", "denied": "⊘", "error": "✗"}.get(self.status, "•")
         tag, rest, tcolor = tool_tag(self.label)
-        t.append(("▾ " if self.expanded else "▸ "), style=color)
+        t.append(mark + " ", style=f"bold {color}")
         t.append(f" {tag} ", style=f"bold {BG} on {tcolor}")
         t.append("  " + rest, style=f"bold {FG2}")
         if self.status == "denied":
@@ -3399,11 +3446,14 @@ class ToolCard(Static):
             extra = len(self.detail_lines) - self.EXPANDED_LINES
             if extra > 0:
                 t.append(f"\n   … {extra} more lines", style=MUTED)
+            t.append("\n   ▾ click to fold", style=f"italic {MUTED}")
         else:
             for line in self.short.splitlines()[:self.COLLAPSED_LINES]:
                 t.append("\n   " + line[:150], style=MUTED)
             if self.can_expand:
-                t.append("\n   click to expand", style=f"dim {MUTED}")
+                more = max(0, len(self.detail_lines) - min(len(self.short.splitlines()), self.COLLAPSED_LINES))
+                t.append(f"\n   ▸ {more} more line{'s' if more != 1 else ''}" if more else "\n   ▸ show all",
+                         style=f"italic {MUTED}")
         return t
 
     def refresh_card(self):
@@ -4640,7 +4690,7 @@ class ConfirmScreen(ModalScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
-            yield Static(Text(self.title_text, style="bold"), classes="title")
+            yield Static(dialog_title(self.title_text), classes="title")
             if self.detail:
                 yield Static(Text(self.detail, style=MUTED))
             with Horizontal(classes="buttons"):
@@ -4662,7 +4712,8 @@ class OcodeApp(App):
     def get_css_variables(self):
         v = super().get_css_variables()
         v.update({"oc-bg": BG, "oc-panel": PANEL, "oc-panel2": PANEL2, "oc-hover": HOVER, "oc-fg": FG,
-                  "oc-muted": MUTED, "oc-accent": ACCENT, "oc-red": RED})
+                  "oc-muted": MUTED, "oc-accent": ACCENT, "oc-red": RED, "oc-yellow": YELLOW, "oc-green": GREEN,
+                  "oc-cyan": CYAN})
         return v
 
     def _delegate(name):
@@ -4689,7 +4740,7 @@ class OcodeApp(App):
     #stage.chatting #subtitle { display: none; }
     #stage.chatting #logo { display: none; }
     #tabbar { width: 100%; height: 1; margin-top: 1; }
-    .chat { display: none; width: 100%; height: 1fr; scrollbar-size-vertical: 1;
+    .chat { display: none; width: 100%; height: 1fr; margin-top: 1; scrollbar-size-vertical: 1;
              scrollbar-background: $oc-bg; scrollbar-color: $oc-panel2;
              scrollbar-color-hover: $oc-hover; scrollbar-color-active: $oc-hover; }
 
@@ -4714,6 +4765,7 @@ class OcodeApp(App):
              padding: 1 2; margin-top: 1; }
     .assistant { width: 100%; height: auto; padding: 0 2 0 3; margin-top: 1; }
     .tool { width: 100%; height: auto; padding: 0 3; margin-top: 1; color: $oc-muted; }
+    .meta { width: 100%; height: auto; padding: 0 3; margin-top: 1; margin-bottom: 1; }
     .tool:hover { background: $oc-panel; }
     #foot-stats { width: auto; margin-right: 2; }
     #attach { width: 100%; height: 1; margin-bottom: 1; display: none; }
@@ -4759,9 +4811,13 @@ class OcodeApp(App):
     .error { width: 100%; height: auto; padding: 0 3; color: $oc-red; margin-top: 1; }
     .info { width: 100%; height: auto; padding: 0 3; color: $oc-muted; margin-top: 1; }
 
-    ModalScreen { align: center middle; background: $oc-bg 70%; }
-    #dialog { width: 78; max-width: 94%; height: auto; max-height: 90%; background: $oc-panel; padding: 1 2; }
-    .title { width: 100%; margin-bottom: 1; }
+    ModalScreen { align: center middle; background: $oc-bg 75%; }
+    VerticalScroll { scrollbar-size-vertical: 1; scrollbar-background: $oc-panel; scrollbar-color: $oc-hover;
+                     scrollbar-color-hover: $oc-muted; scrollbar-color-active: $oc-muted; }
+    #dialog { width: 78; max-width: 94%; height: auto; max-height: 90%; background: $oc-panel; padding: 1 3;
+              border: round $oc-hover; }
+    #dialog.warn { border: round $oc-yellow; }
+    .title { width: 100%; margin-bottom: 1; padding-bottom: 1; border-bottom: solid $oc-panel2; height: auto; }
     .hint { margin-top: 1; }
     .subtitle { margin-top: 1; }
     .row { width: 100%; height: 1; margin-top: 1; }
@@ -4771,18 +4827,29 @@ class OcodeApp(App):
     #mem-summary { margin-bottom: 1; }
     #dialog Input { background: $oc-bg; border: none; height: 1; padding: 0 1; }
     #dialog Input:focus { border: none; background: $oc-panel2; }
+    #dialog Input > .input--placeholder { color: $oc-muted; }
     OptionList { background: $oc-panel; border: none; padding: 0; height: auto; max-height: 14; }
     OptionList:focus { border: none; background: $oc-panel; }
-    OptionList > .option-list--option-highlighted { background: $oc-accent; color: $oc-bg; text-style: none; }
-    OptionList:focus > .option-list--option-highlighted { background: $oc-accent; color: $oc-bg; text-style: none; }
+    OptionList > .option-list--option-highlighted { background: $oc-hover; color: $oc-fg; text-style: none; }
+    OptionList:focus > .option-list--option-highlighted { background: $oc-hover; color: $oc-fg; text-style: none; }
+    OptionList > .option-list--option-hover { background: $oc-panel2; }
     #palette-input { margin-bottom: 1; }
-    Button { border: none; height: 1; min-width: 14; background: $oc-panel2; color: $oc-fg; padding: 0 2; }
+    Button { border: none; height: 1; min-width: 12; background: $oc-panel2; color: $oc-fg; padding: 0 2; }
     Button:hover { background: $oc-hover; }
     Button:focus { background: $oc-hover; text-style: bold; }
-    #yes { background: $oc-accent; color: $oc-bg; }
+    #yes { background: $oc-accent; color: $oc-bg; text-style: bold; }
+    #yes:hover, #yes:focus { background: $oc-accent; color: $oc-bg; text-style: bold underline; }
+    #no { color: $oc-red; }
+    .row { width: 100%; height: 1; margin-top: 1; }
+    Toast { background: $oc-panel2; color: $oc-fg; border-left: outer $oc-accent; padding: 1 2; }
+    Toast.-warning { border-left: outer $oc-yellow; }
+    Toast.-error { border-left: outer $oc-red; }
+    Toast .toast--title { color: $oc-accent; text-style: bold; }
+    Toast.-warning .toast--title { color: $oc-yellow; }
+    Toast.-error .toast--title { color: $oc-red; }
     .buttons { height: 1; margin-top: 1; width: 100%; }
     .buttons Button { margin-right: 2; }
-    #preview { margin-top: 1; padding: 1 1; background: $oc-bg; }
+    #preview { margin-top: 1; padding: 1 2; background: $oc-bg; border-left: outer $oc-panel2; }
     """
 
     BINDINGS = [
@@ -4899,8 +4966,9 @@ class OcodeApp(App):
         if seen != VERSION:
             self.cfg["seen_version"] = VERSION
             save_settings(self.cfg)
-            if seen and self.cfg.get("show_highlights", True) and VERSION in WHATS_NEW:
-                self.set_timer(1.5, self.open_highlights)
+            if (seen and self.cfg.get("show_highlights", True)
+                    and any(parse_version(seen) < parse_version(v) <= parse_version(VERSION) for v in WHATS_NEW)):
+                self.set_timer(1.5, lambda: self.open_highlights(since=seen))
         self.query_one("#sysmon").display = self.cfg["monitor"]
         self.monitor.set_fast(self.cfg["monitor"])
         self.monitor.start()
@@ -4923,6 +4991,8 @@ class OcodeApp(App):
         if self.transcribing or self.busy:
             t.append(SPIN[self.spin % len(SPIN)] + " ", style=ACCENT)
             t.append((self.mic_activity if self.transcribing else self.activity) or "working…", style="bold")
+            if self.busy and self.cur_tab.turn_started:
+                t.append(f"  {fmt_secs(time.monotonic() - self.cur_tab.turn_started)}", style=MUTED)
             if self.cur_tab.queue:
                 t.append(f"   {len(self.cur_tab.queue)} queued", style=f"bold {YELLOW}")
             t.append("   esc to interrupt" + ("  ·  enter queues another message" if self.busy else ""), style=MUTED)
@@ -5103,6 +5173,8 @@ class OcodeApp(App):
             else:
                 icon, istyle = str(i + 1), MUTED
             add(" ", bg, "select", tab.id)
+            if cur and icon == str(i + 1):
+                istyle = f"bold {ACCENT}"
             add(icon, f"{istyle} {bg}".strip(), "select", tab.id)
             add(" " + title + " ", (f"bold {FG} {bg}" if cur else MUTED).strip(), "select", tab.id)
             if cur and n > 1:
@@ -5341,6 +5413,16 @@ class OcodeApp(App):
 
     def ui_remove(self, w):
         w.remove()
+
+    def ui_reply_meta(self, tab, agent, model, secs):
+        """A quiet line under each finished reply: which mode and model answered, and how long it took."""
+        t = Text()
+        t.append("◆ ", style=agent_color(agent))
+        t.append(AGENT_LABEL[agent], style=f"bold {agent_color(agent)}")
+        t.append(f"  ·  {model}  ·  {fmt_secs(secs)}", style=MUTED)
+        if tab.tps:
+            t.append(f"  ·  {tab.tps:.0f} tok/s", style=MUTED)
+        self.add_widget(Static(t, classes="meta"), tab)
 
     def ui_tool(self, tab, label, short, status, detail=""):
         self.add_widget(ToolCard(label, short, detail, status), tab)
@@ -5724,6 +5806,8 @@ class OcodeApp(App):
                     return
                 if not calls:
                     final_reply = visible_text(reply, tools_on)
+                    if final_reply:
+                        self.ui(self.ui_reply_meta, tab, agent, cfg["model"], time.monotonic() - tab.turn_started)
                     if final_reply and tab is self.cur_tab and not tab.closed and tab.source != "discord":
                         self.speak_reply(final_reply)
                     return
@@ -6196,8 +6280,8 @@ class OcodeApp(App):
             self.notify(f"Couldn't summarize: {err or 'the model returned nothing'}", severity="error")
         self.refresh_chrome()
 
-    def open_highlights(self):
-        self.push_screen(HighlightsScreen())
+    def open_highlights(self, since=""):
+        self.push_screen(HighlightsScreen(since))
 
     # ----- updates -----
     def auto_update_check(self):
@@ -7130,7 +7214,7 @@ class OcodeApp(App):
         if not on_:
             self.speaker.stop()
         self.refresh_chrome()
-        self.notify("Spoken replies " + ("ON" if on_ else "off"))
+        self.notify("Spoken replies " + ("on" if on_ else "off"))
 
     def palette_entries(self):
         """(id, group, title, shortcut, status) for every command. The menu sorts them."""
@@ -7276,7 +7360,7 @@ class OcodeApp(App):
             elif cid == "auto":
                 self.cfg["auto_approve"] = not self.cfg["auto_approve"]
                 save_settings(self.cfg)
-                self.notify("Auto-approve " + ("ON" if self.cfg["auto_approve"] else "off"))
+                self.notify("Auto-approve " + ("on" if self.cfg["auto_approve"] else "off"))
             elif cid == "newtab":
                 self.new_tab()
             elif cid == "tabs":
