@@ -112,7 +112,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.4.1"
+VERSION = "4.4.2"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -667,6 +667,28 @@ def tools_block(allowed):
     return docs + ("\n\nNotes:\n" + "\n".join("- " + n for n in notes) if notes else "")
 
 
+def now_context(now=None):
+    """The current date and time, for the system prompt (rebuilt every message, so it's always fresh)."""
+    now = (now or datetime.datetime.now()).astimezone()
+    off = now.strftime("%z")
+    off = f"UTC{off[:3]}:{off[3:]}" if off else "UTC"
+    zone = now.tzname() or ""
+    zone = f"{zone}, {off}" if zone and zone not in off else off
+    hour = now.strftime("%I").lstrip("0") or "12"
+    week = now.isocalendar()[1]
+    season = ["winter", "winter", "spring", "spring", "spring", "summer", "summer", "summer", "autumn", "autumn",
+              "autumn", "winter"][now.month - 1]
+    part = ("night" if now.hour < 5 else "morning" if now.hour < 12 else "afternoon" if now.hour < 17
+            else "evening" if now.hour < 21 else "night")
+    return (f"Right now it is {now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year} at "
+            f"{hour}:{now.strftime('%M %p')} ({zone}) - {part}, week {week}, day {now.timetuple().tm_yday} of the "
+            f"year, {season} in the northern hemisphere. ISO: {now.strftime('%Y-%m-%dT%H:%M%z')}.\n"
+            "This comes from the user's computer clock, so trust it over anything you remember: your training data "
+            "is older. Use it whenever the date, day, time, month or year matters (\"today\", \"tomorrow\", "
+            "\"how long until…\", ages, deadlines, \"latest\"). Work out other dates from it, e.g. what day "
+            "a date falls on.")
+
+
 def build_system(agent, cwd, extra="", spoken=False, allowed=frozenset()):
     if agent == "chat":
         s = PROMPT_CHAT
@@ -674,6 +696,7 @@ def build_system(agent, cwd, extra="", spoken=False, allowed=frozenset()):
         s = PROMPT_PLAN.format(cwd=cwd, os=platform.system(), tools=tools_block(allowed))
     else:
         s = PROMPT_BUILD.format(cwd=cwd, os=platform.system(), tools=tools_block(allowed))
+    s += "\n\n" + now_context()
     if spoken:
         s += "\n\n" + PROMPT_VOICE
     if extra:
@@ -2475,6 +2498,9 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
 
 
 WHATS_NEW = {
+    "4.4.2": [
+        ("Knows the date", "The AI now always knows today's date, the day of the week, the time and your time zone."),
+    ],
     "4.4.1": [
         ("/update", "Sees a new push straight away - no more waiting 5 minutes for GitHub's cache."),
     ],
