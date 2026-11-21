@@ -141,14 +141,6 @@ Type `/update` inside ocode (or run `ocode update` in Command Prompt). ocode che
 what changed, and asks before installing. On Windows it closes, updates in a new window, and reopens with your chats.
 It also checks once a day by itself and tells you when a new version is out. `ocode update --check` only looks.
 
-## Releasing a new version (for the maintainer)
-
-1. Make your changes to `ocode.py`.
-2. Bump `VERSION = "..."` near the top of `ocode.py` (e.g. `4.1.0` → `4.2.0`).
-3. Commit and push to `main`. That's it - everyone's `/update` picks it up, and your commit messages are shown
-   as "Recent changes". (Forgot to bump the version? Users are still offered "a newer build", but bumping it is clearer.)
-
-The repository must be **public** for `/update` to work, because each copy downloads from GitHub without logging in.
 
 ## Troubleshooting
 
