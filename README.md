@@ -3,7 +3,7 @@
 An opencode-style AI coding assistant for your terminal, powered by your own **local Ollama models**.
 
 Chat, edit files and run commands (with your approval), look at images, videos and your screen, talk to it,
-read your Gmail / Calendar / Drive, run a Discord bot, watch your CPU / RAM / GPU - all from one command: `ocode`.
+read your Gmail / Calendar / Drive, run a Discord or Telegram bot, plug in MCP servers, watch your CPU / RAM / GPU - all from one command: `ocode`.
 
 ## Install (Windows)
 
@@ -111,6 +111,18 @@ In Build and Plan mode ocode can also search your whole project and read web pag
 **Your own commands:** save a prompt as a Markdown file in `%USERPROFILE%\.ocode\commands\` (or in a project's
 `.ocode\commands\` folder) and it becomes a slash command named after the file. `$ARGUMENTS` is replaced by
 whatever you type after it - e.g. `standup.md` containing `Summarise today's git log. $ARGUMENTS` gives you `/standup`.
+
+## Connections
+
+Type `/connections` to see everything ocode can link to and what's connected.
+
+- **MCP servers** (`/mcp`): plug-in tools for the AI. Press `a` for one-click presets: Git, Fetch (read web pages), Time, Filesystem, Memory graph, Sequential thinking, Playwright (control a browser), Context7 (live library docs), GitHub (needs a token), or any custom command / `https://` URL.
+  - The `npx` presets need [Node.js](https://nodejs.org); the `uvx` ones need uv (`python -m pip install uv`).
+  - Servers are saved in `~/.ocode/mcp.json`, in the same `"mcpServers"` format Claude Desktop and Cursor use, so you can paste configs straight in (`o` in `/mcp` opens the file).
+  - Read-only MCP tools work in Plan mode. Tools that can change things only work in Build mode and ask you first.
+- **Telegram** (`/telegram`): chat with ocode from your phone. Message @BotFather, send `/newbot`, paste the token into `/telegram`, click Connect, then send your bot the pairing code ocode shows. Only your paired account gets answers. No extra packages needed.
+- **Phone notifications** (`/notify`): install the free ntfy app, subscribe to a hard-to-guess topic name, and type the same name in `/notify`. You'll get a ping when a long task finishes or ocode needs your OK.
+- **Discord** (`/discord`) and **Google** (`/google`), as before.
 
 ## Optional features
 
