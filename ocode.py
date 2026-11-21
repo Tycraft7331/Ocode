@@ -112,7 +112,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.4.0"
+VERSION = "4.4.1"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -2475,6 +2475,9 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
 
 
 WHATS_NEW = {
+    "4.4.1": [
+        ("/update", "Sees a new push straight away - no more waiting 5 minutes for GitHub's cache."),
+    ],
     "4.4.0": [
         ("/mcp", "Connect MCP servers - the plug-in standard many AI tools use. One-click presets for Git, web "
                  "fetching, GitHub, browser control (Playwright), live library docs (Context7), files, memory and time."),
@@ -9040,8 +9043,18 @@ def _github_get(url, timeout=20, accept="*/*"):
 def fetch_latest(cfg=None, notes=True):
     """Looks at the newest ocode.py on GitHub. Returns {version, digest, notes, repo, branch}."""
     repo, branch = update_repo(cfg), UPDATE_BRANCH
+    # GitHub caches the branch's raw file for up to 5 minutes after a push, so look up the newest commit first
+    # and read the file at that exact commit - then /update sees a push right away.
+    commits, ref = None, branch
     try:
-        src = _github_get(f"https://raw.githubusercontent.com/{repo}/{branch}/ocode.py")
+        commits = json.loads(_github_get(f"https://api.github.com/repos/{repo}/commits?sha={branch}&per_page=6",
+                                         timeout=10, accept="application/vnd.github+json"))
+        if isinstance(commits, list) and commits and re.fullmatch(r"[0-9a-f]{40}", commits[0].get("sha", "")):
+            ref = commits[0]["sha"]
+    except Exception:
+        commits = None  # API limit reached or offline: fall back to the (maybe cached) branch file
+    try:
+        src = _github_get(f"https://raw.githubusercontent.com/{repo}/{ref}/ocode.py")
     except UpdateError as e:
         if str(e) == "not-found":
             raise UpdateError(f"Couldn't find ocode.py in github.com/{repo} (branch '{branch}'). The repository "
@@ -9051,14 +9064,10 @@ def fetch_latest(cfg=None, notes=True):
     if not m:
         raise UpdateError(f"github.com/{repo} has an ocode.py, but no VERSION line in it.")
     info = {"version": m.group(1).decode(), "digest": hashlib.sha256(_norm_source(src)).hexdigest(),
-            "notes": [], "repo": repo, "branch": branch}
-    if notes:  # the latest commit messages, as "what's new" (best effort)
-        try:
-            commits = json.loads(_github_get(f"https://api.github.com/repos/{repo}/commits?sha={branch}&per_page=6",
-                                             timeout=10, accept="application/vnd.github+json"))
-            info["notes"] = [c["commit"]["message"].splitlines()[0][:90] for c in commits if c.get("commit")]
-        except Exception:
-            pass
+            "notes": [], "repo": repo, "branch": branch, "ref": ref}
+    if notes and isinstance(commits, list):  # the latest commit messages, as "what's new"
+        info["notes"] = [c["commit"]["message"].splitlines()[0][:90] for c in commits
+                         if c.get("commit") and not c["commit"]["message"].startswith("Merge ")]
     return info
 
 
@@ -9096,7 +9105,10 @@ def install_kind():
 
 
 def archive_url(info):
-    return f"https://github.com/{info['repo']}/archive/refs/heads/{info['branch']}.zip"
+    ref = info.get("ref") or info["branch"]
+    if ref != info["branch"]:
+        return f"https://github.com/{info['repo']}/archive/{ref}.zip"
+    return f"https://github.com/{info['repo']}/archive/refs/heads/{ref}.zip"
 
 
 def pip_install_commands(info):
@@ -9117,7 +9129,7 @@ def pip_install_commands(info):
 
 def replace_own_file(info):
     """For a plain `python ocode.py` copy: download the new file over this one (a .bak copy is kept)."""
-    data = _github_get(f"https://raw.githubusercontent.com/{info['repo']}/{info['branch']}/ocode.py")
+    data = _github_get(f"https://raw.githubusercontent.com/{info['repo']}/{info.get('ref') or info['branch']}/ocode.py")
     try:
         compile(data, "ocode.py", "exec")
     except SyntaxError as e:
