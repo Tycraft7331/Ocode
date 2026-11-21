@@ -113,7 +113,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.5.0"
+VERSION = "4.6.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -649,6 +649,40 @@ class Memory:
                                "project": project if scope == "project" else None, "created": time.time()})
             self._save()
         return True
+
+    def update(self, fid, text=None, scope=None, project=None):
+        """Change a memory's text and/or where it applies. Returns False if it no longer exists or is empty."""
+        with self.lock:
+            f = next((x for x in self.facts if x["id"] == fid), None)
+            if f is None:
+                return False
+            if text is not None:
+                text = " ".join(str(text).split())[:300]
+                if len(text) < 2:
+                    return False
+                f["text"] = text
+            if scope in ("user", "project"):
+                f["scope"] = scope
+                f["project"] = project if scope == "project" else None
+            f["edited"] = time.time()
+            self._save()
+        return True
+
+    def get(self, fid):
+        with self.lock:
+            return next((dict(x) for x in self.facts if x["id"] == fid), None)
+
+    def search(self, query):
+        """Memories matching some words, best first."""
+        q = query.lower().strip()
+        qt = tokens(q)
+        scored = []
+        for f in self.all():
+            low = f["text"].lower()
+            score = (3 if q and q in low else 0) + len(qt & tokens(low))
+            if score:
+                scored.append((score, f))
+        return [f for _, f in sorted(scored, key=lambda p: -p[0])]
 
     def delete(self, fid):
         with self.lock:
@@ -2655,11 +2689,15 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
     "screen": "screenshot look see", "listen": "mic microphone talk voice speech", "speak": "voice tts audio",
     "voice": "mic microphone speech", "memory": "remember facts", "remember": "memory fact",
     "update": "upgrade new version github latest", "model": "ollama llm", "theme": "colour color dark light", "randomtheme": "colour color surprise",
-    "logo": "gradient banner", "welcome": "greeting hello banner home", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
+    "logo": "gradient banner", "welcome": "greeting hello banner home", "editmemory": "change fix update memories remember", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
 }
 
 
 WHATS_NEW = {
+    "4.6.0": [
+        ("/editmemory", "Edit what ocode remembers. /editmemory coffee jumps straight to that memory; in /memory press "
+                        "enter to edit, s to switch between you and this project, / to search."),
+    ],
     "4.5.0": [
         ("Welcome", "A big welcome message on the home screen with your name, the time and the date. "
                     "/name changes what ocode calls you, /welcome turns it off."),
@@ -3455,7 +3493,9 @@ HELP_TOPICS = [
       ("/voice", "voice, speed, microphone and speech-recognition settings")]),
     ("memory", "Memory",
      "ocode remembers useful facts about you and your projects between sessions.",
-     [("/memory", "see, add and delete what ocode remembers"),
+     [("/memory", "see, add, edit and delete what ocode remembers  (/memory <words> searches)"),
+      ("/editmemory [words]", "edit a memory - with words, jumps to the one that matches"),
+      ("in /memory", "enter edit · s you/this project · d delete · a add · p add a project note · / search · c clear all"),
       ("/remember <text>", "save a fact right now"),
       ("remember that ...", "say it in a normal message and ocode saves it"),
       ("auto-memory", "ocode also learns facts from your chats (switch it off in /settings)"),
@@ -4316,11 +4356,16 @@ class MemoryScreen(ModalScreen):
         Binding("a", "add('user')", show=False),
         Binding("p", "add('project')", show=False),
         Binding("c", "clear", show=False),
+        Binding("e", "edit", show=False),
+        Binding("s", "swap", show=False),
+        Binding("slash", "find", show=False),
     ]
 
-    def __init__(self):
+    def __init__(self, query="", edit_first=False):
         super().__init__()
         self._confirm_clear = False
+        self.query_text = query
+        self.edit_first = edit_first
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
@@ -4332,12 +4377,14 @@ class MemoryScreen(ModalScreen):
     def on_mount(self):
         self.refill()
         self.query_one(OptionList).focus()
+        if self.edit_first:
+            self.set_timer(0.05, self.action_edit)
 
     def refill(self, index=0):
         mem, app = self.app.memory, self.app
         ol = self.query_one(OptionList)
         ol.clear_options()
-        facts = mem.all()
+        facts = mem.search(self.query_text) if self.query_text else mem.all()
         for f in facts:
             t = Text(no_wrap=True, overflow="ellipsis")
             if f["scope"] == "project":
@@ -4345,19 +4392,29 @@ class MemoryScreen(ModalScreen):
             else:
                 t.append(" you ", style=f"{BG} on {CYAN}")
             t.append("  " + f["text"], style=FG)
-            ol.add_option(Option(option_row(t, time.strftime("%b %d", time.localtime(f["created"]))), id=f["id"]))
-        if not facts:
+            when = time.strftime("%b %d", time.localtime(f.get("edited") or f["created"]))
+            right = Text(("edited " if f.get("edited") else "") + when, style=MUTED)
+            ol.add_option(Option(option_row(t, right), id=f["id"]))
+        if not facts and self.query_text:
+            ol.add_option(Option(Text(f"No memories match \"{self.query_text}\". Press / to search again.",
+                                      style="dim"), disabled=True))
+        elif not facts:
             ol.add_option(Option(Text("Nothing remembered yet. Just talk to me, or press a to add a memory.",
                                       style="dim"), disabled=True))
         elif ol.option_count:
             ol.highlighted = max(0, min(index, ol.option_count - 1))
         summary = app.summary
         sw = self.query_one("#mem-summary", Static)
-        sw.display = bool(summary)
-        sw.update(Text("This session so far: " + summary[:350] + ("…" if len(summary) > 350 else ""), style=MUTED)
-                  if summary else "")
+        if self.query_text:
+            sw.display = True
+            sw.update(Text.assemble(("Showing memories matching ", MUTED), (f"\"{self.query_text}\"", f"bold {FG2}"),
+                                    (f"  ·  {len(facts)} found", MUTED)))
+        else:
+            sw.display = bool(summary)
+            sw.update(Text("This session so far: " + summary[:350] + ("…" if len(summary) > 350 else ""), style=MUTED)
+                      if summary else "")
         self.query_one("#mem-hint", Static).update(keys_hint(
-            ("d", "delete"), ("a", "add"), ("p", "project note"), ("c", "clear all"), ("esc", "close"),
+            ("enter", "edit"), ("s", "you/project"), ("d", "delete"), ("a", "add"), ("/", "search"), ("esc", "close"),
             warn="Press c again to ERASE ALL memories." if self._confirm_clear else None))
 
     def _current(self):
@@ -4366,6 +4423,51 @@ class MemoryScreen(ModalScreen):
             return None, 0
         opt = ol.get_option_at_index(ol.highlighted)
         return opt.id, ol.highlighted
+
+    @on(OptionList.OptionSelected, "#mem-list")
+    def _selected(self, e):
+        self.action_edit()
+
+    def action_edit(self):
+        fid, idx = self._current()
+        f = self.app.memory.get(fid) if fid else None
+        if not f:
+            return
+        self._confirm_clear = False
+
+        def done(v):
+            if v is None:
+                return
+            if not v.strip():
+                self.app.memory.delete(fid)
+                self.app.notify("Memory deleted.", title="Memory", timeout=2)
+            elif v.strip() != f["text"]:
+                self.app.memory.update(fid, v)
+                self.app.notify("Memory updated.", title="Memory", timeout=2)
+            self.refill(idx)
+            self.app.refresh_chrome()
+        where = "this project" if f["scope"] == "project" else "you"
+        self.app.push_screen(InputScreen(f"Edit memory about {where}  (empty = delete)", f["text"], select=False), done)
+
+    def action_swap(self):
+        fid, idx = self._current()
+        f = self.app.memory.get(fid) if fid else None
+        if not f:
+            return
+        if f["scope"] == "user":
+            self.app.memory.update(fid, scope="project", project=self.app.cwd)
+            self.app.notify(f"Now only used in {Path(self.app.cwd).name or self.app.cwd}.", title="Memory", timeout=3)
+        else:
+            self.app.memory.update(fid, scope="user")
+            self.app.notify("Now used everywhere.", title="Memory", timeout=3)
+        self.refill(idx)
+
+    def action_find(self):
+        def done(v):
+            if v is not None:
+                self.query_text = v.strip()
+                self.refill()
+        self.app.push_screen(InputScreen("Search memories (empty = show all)", self.query_text), done)
 
     def action_delete(self):
         fid, idx = self._current()
@@ -4443,14 +4545,14 @@ class ApprovalScreen(ModalScreen):
 class InputScreen(ModalScreen):
     BINDINGS = [Binding("escape", "close", "Close")]
 
-    def __init__(self, title, value=""):
+    def __init__(self, title, value="", select=True):
         super().__init__()
-        self.title_text, self.value = title, value
+        self.title_text, self.value, self.select = title, value, select
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dialog"):
             yield Static(dialog_title(self.title_text), classes="title")
-            yield Input(self.value, id="modal-input")
+            yield Input(self.value, id="modal-input", select_on_focus=self.select)
             yield Static(keys_hint(("enter", "confirm"), ("esc", "cancel")), classes="hint")
 
     @on(Input.Submitted)
@@ -8525,7 +8627,22 @@ class OcodeApp(App):
         elif cmd == "/cd":
             self.change_dir(arg)
         elif cmd in ("/memory", "/mem"):
-            self.push_screen(MemoryScreen())
+            self.push_screen(MemoryScreen(query=arg.strip()))
+        elif cmd in ("/editmemory", "/memedit", "/editmem", "/edit-memory"):
+            q = arg.strip()
+            if not self.memory.all():
+                self.notify("Nothing remembered yet. /remember <text> adds a memory.", title="Memory")
+            elif not q:
+                self.push_screen(MemoryScreen())
+                self.notify("Pick a memory and press enter to edit it.", timeout=3)
+            else:
+                hits = self.memory.search(q)
+                if not hits:
+                    self.notify(f"No memory mentions \"{q[:40]}\" - showing them all.", title="Memory", timeout=4)
+                    self.push_screen(MemoryScreen())
+                else:
+                    # one clear match goes straight to the editor; otherwise pick from the matches
+                    self.push_screen(MemoryScreen(query=q, edit_first=len(hits) == 1))
         elif cmd == "/remember":
             if arg and self.memory.add(arg, "user"):
                 self.refresh_chrome()
@@ -8656,6 +8773,7 @@ class OcodeApp(App):
             ("voice", "Images, voice & screen", "Voice & microphone settings…", "", ""),
             # Memory
             ("memory", "Memory", "View memory…", "", f"{len(self.memory.facts)} saved"),
+            ("editmemory", "Memory", "Edit a memory…", "", ""),
             ("remember", "Memory", "Add a memory…", "", ""),
             # Model & look
             ("model", "Model & look", "Choose model…", "", c["model"] or "none"),
@@ -8731,6 +8849,8 @@ class OcodeApp(App):
                 self.action_attach()
             elif cid == "speak":
                 self.set_speak(not self.cfg["speak"])
+            elif cid == "editmemory":
+                self.slash("/editmemory")
             elif cid == "memory":
                 self.push_screen(MemoryScreen())
             elif cid == "remember":
