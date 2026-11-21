@@ -113,7 +113,7 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.6.0"
+VERSION = "4.7.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
@@ -229,6 +229,9 @@ DEFAULTS = {
     "temperature": 0.2,
     "num_ctx": 8192,
     "auto_memory": True,      # learn facts from conversations automatically
+    "memory_tidy": True,      # remove duplicate memories and ones that stopped mattering
+    "memory_forget_days": 60, # learned memories not needed for this many days fade away
+    "last_memory_tidy": 0,
     "speak": True,            # speak replies out loud
     "voice": "",              # "" = automatically pick a male voice
     "voice_rate": 0,          # -10 (slow) .. 10 (fast)
@@ -609,6 +612,18 @@ def tokens(s):
     return {w for w in re.findall(r"[a-z0-9_.\-]+", s.lower()) if w not in STOP_WORDS and len(w) > 1}
 
 
+def stems(s):
+    """tokens() with simple word endings removed, so "deploys" / "deployed" / "deploying" all match "deploy"."""
+    out = set()
+    for w in tokens(s):
+        for end in ("ing", "ed", "es", "s"):
+            if len(w) > len(end) + 3 and w.endswith(end):
+                w = w[:-len(end)]
+                break
+        out.add(w)
+    return out
+
+
 class Memory:
     """Long-term facts stored in ~/.ocode/memory.json.
     scope 'user'    -> true everywhere (name, preferences, skills ...)
@@ -617,20 +632,145 @@ class Memory:
     def __init__(self, path=MEMORY_FILE):
         self.path = path
         self.lock = threading.Lock()
-        self.facts = []
+        self.facts, self.forgotten = [], []
         try:
-            self.facts = json.loads(path.read_text(encoding="utf-8")).get("facts", [])
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.facts = data.get("facts", [])
+            self.forgotten = data.get("forgotten", [])
         except Exception:
             self.facts = []
+        now, changed = time.time(), False
+        for f in self.facts:  # memories from before 4.7 start their "unused" clock today
+            if "source" not in f:
+                f["source"], changed = "legacy", True
+            if "last_used" not in f:
+                f["last_used"], changed = now, True
+        if changed:
+            self._save()
 
     def _save(self):
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps({"facts": self.facts}, indent=2), encoding="utf-8")
+            self.path.write_text(json.dumps({"facts": self.facts, "forgotten": self.forgotten}, indent=2),
+                                 encoding="utf-8")
         except Exception:
             pass
 
-    def add(self, text, scope="user", project=None):
+    @staticmethod
+    def kept(f):
+        """Memories you wrote, edited or chose to keep never fade (they can still be merged with a duplicate)."""
+        return f.get("pinned") or f.get("source") == "you" or bool(f.get("edited"))
+
+    def touch(self, ids, save=True):
+        now = time.time()
+        with self.lock:
+            hit = False
+            for f in self.facts:
+                if f["id"] in ids:
+                    f["last_used"] = now
+                    f["uses"] = f.get("uses", 0) + 1
+                    hit = True
+            if hit and save:
+                self._save()
+
+    def fades_in(self, f, forget_days, now=None):
+        """Days until a learned memory is forgotten if it's not needed again (None = it never fades)."""
+        if self.kept(f):
+            return None
+        days = forget_days * (3 if f.get("uses", 0) >= 3 else 1)
+        idle = ((now or time.time()) - (f.get("last_used") or f.get("created") or 0)) / 86400
+        return max(0, int(days - idle + 0.999))
+
+    def tidy(self, forget_days=60, now=None, folder_exists=os.path.isdir):
+        """Merge clones and forget learned memories that stopped mattering. Returns [(text, reason)]."""
+        now = now or time.time()
+        removed = []
+
+        def better(a, b):  # which of two near-identical memories to keep
+            ka = (self.kept(a), a.get("edited") or a.get("created", 0), len(a["text"]))
+            kb = (self.kept(b), b.get("edited") or b.get("created", 0), len(b["text"]))
+            return (a, b) if ka >= kb else (b, a)
+
+        with self.lock:
+            facts = list(self.facts)
+            gone = set()
+            # 1) clones: same idea written twice (or one memory that's contained in another)
+            for i, a in enumerate(facts):
+                if a["id"] in gone:
+                    continue
+                ta = stems(a["text"])
+                for b in facts[i + 1:]:
+                    if b["id"] in gone or a["id"] in gone:
+                        continue
+                    same_place = (a["scope"] == b["scope"] and a.get("project") == b.get("project")) or \
+                                 "user" in (a["scope"], b["scope"])
+                    if not same_place:
+                        continue
+                    tb = stems(b["text"])
+                    if not ta or not tb:
+                        continue
+                    sim = len(ta & tb) / len(ta | tb)
+                    inside = min(len(ta), len(tb)) >= 2 and (ta <= tb or tb <= ta)
+                    if sim >= 0.6 or inside or a["text"].lower() == b["text"].lower():
+                        if a["scope"] != b["scope"]:  # a project copy of something true everywhere
+                            keep, drop = (a, b) if a["scope"] == "user" else (b, a)
+                        elif inside and sim < 0.6 and ta != tb:  # keep the one that says more
+                            keep, drop = (a, b) if len(ta) > len(tb) else (b, a)
+                        else:
+                            keep, drop = better(a, b)
+                        keep["uses"] = keep.get("uses", 0) + drop.get("uses", 0)
+                        keep["last_used"] = max(keep.get("last_used") or 0, drop.get("last_used") or 0)
+                        if drop.get("pinned"):
+                            keep["pinned"] = True
+                        gone.add(drop["id"])
+                        removed.append((drop, f"duplicate of \"{keep['text'][:60]}\""))
+            # 2) learned memories nobody has needed for a long time
+            for f in facts:
+                if f["id"] in gone:
+                    continue
+                idle_days = (now - (f.get("last_used") or f.get("created") or now)) / 86400
+                if f["scope"] == "project" and f.get("project") and not folder_exists(f["project"]) \
+                        and idle_days > 14 and not f.get("pinned"):
+                    gone.add(f["id"])
+                    removed.append((f, "its project folder no longer exists"))
+                    continue
+                left = self.fades_in(f, forget_days, now)
+                if left is not None and left <= 0:
+                    gone.add(f["id"])
+                    removed.append((f, f"not needed in {int(idle_days)} days"))
+            if gone:
+                self.facts = [f for f in self.facts if f["id"] not in gone]
+                for f, why in removed:
+                    self.forgotten.append(dict(f, forgotten=now, reason=why))
+            # the undo list only keeps the last 100, for 90 days
+            self.forgotten = [f for f in self.forgotten if now - f.get("forgotten", now) < 90 * 86400][-100:]
+            self._save()
+        return [(f["text"], why) for f, why in removed]
+
+    def restore(self, fid):
+        with self.lock:
+            f = next((x for x in self.forgotten if x["id"] == fid), None)
+            if f is None:
+                return False
+            self.forgotten = [x for x in self.forgotten if x["id"] != fid]
+            f = {k: v for k, v in f.items() if k not in ("forgotten", "reason")}
+            f["last_used"], f["pinned"] = time.time(), True  # you brought it back, so it stays
+            self.facts.append(f)
+            self._save()
+        return True
+
+    def set_pinned(self, fid, on):
+        with self.lock:
+            for f in self.facts:
+                if f["id"] == fid:
+                    f["pinned"] = bool(on)
+                    if not on and f.get("source") == "you":
+                        f["source"] = "auto"  # "let it fade" also applies to things you typed
+                        f.pop("edited", None)
+                    f["last_used"] = time.time()
+            self._save()
+
+    def add(self, text, scope="user", project=None, source="you"):
         text = " ".join(str(text).split())[:300]
         if len(text) < 4:
             return False
@@ -640,13 +780,18 @@ class Memory:
             for f in self.facts:
                 if f["scope"] != scope or (scope == "project" and f.get("project") != project):
                     continue
-                if f["text"].lower() == text.lower():
-                    return False
                 ft = tokens(f["text"])
-                if t and ft and len(t & ft) / len(t | ft) >= 0.7:
+                if f["text"].lower() == text.lower() or (t and ft and len(t & ft) / len(t | ft) >= 0.7):
+                    # learning it again means it still matters
+                    f["last_used"], f["uses"] = time.time(), f.get("uses", 0) + 1
+                    if source == "you" and not self.kept(f):
+                        f["pinned"] = True
+                    self._save()
                     return False
+            now = time.time()
             self.facts.append({"id": uuid.uuid4().hex[:8], "text": text, "scope": scope,
-                               "project": project if scope == "project" else None, "created": time.time()})
+                               "project": project if scope == "project" else None, "created": now,
+                               "source": source, "last_used": now, "uses": 0})
             self._save()
         return True
 
@@ -698,13 +843,22 @@ class Memory:
         with self.lock:
             return sorted(self.facts, key=lambda f: f["created"], reverse=True)
 
-    def relevant(self, cwd, query="", limit=30):
+    def relevant(self, cwd, query="", limit=30, track=False):
         with self.lock:
             facts = [f for f in self.facts if f["scope"] == "user" or f.get("project") == cwd]
+        q = stems(query)
         if len(facts) > limit:
-            q = tokens(query)
-            ranked = sorted(enumerate(facts), key=lambda p: (len(q & tokens(p[1]["text"])), p[0]), reverse=True)[:limit]
+            ranked = sorted(enumerate(facts), key=lambda p: (len(q & stems(p[1]["text"])), p[0]), reverse=True)[:limit]
             facts = [f for _, f in sorted(ranked, key=lambda p: p[0])]
+        if track and q:  # a memory "gets used" when the conversation is about it
+            hits = set()
+            for f in facts:
+                ft = stems(f["text"])
+                common = len(q & ft)
+                if common >= 2 or (ft and common and common / len(ft) >= 0.5):
+                    hits.add(f["id"])
+            if hits:
+                self.touch(hits)
         return facts
 
 
@@ -2689,11 +2843,16 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
     "screen": "screenshot look see", "listen": "mic microphone talk voice speech", "speak": "voice tts audio",
     "voice": "mic microphone speech", "memory": "remember facts", "remember": "memory fact",
     "update": "upgrade new version github latest", "model": "ollama llm", "theme": "colour color dark light", "randomtheme": "colour color surprise",
-    "logo": "gradient banner", "welcome": "greeting hello banner home", "editmemory": "change fix update memories remember", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
+    "logo": "gradient banner", "welcome": "greeting hello banner home", "editmemory": "change fix update memories remember", "tidymemory": "clean duplicates forget old prune memories", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
 }
 
 
 WHATS_NEW = {
+    "4.7.0": [
+        ("Tidy memory", "Duplicate memories now merge themselves, and things ocode learned that haven't come up in 60 "
+                        "days fade away. Memories you wrote or edited stay. In /memory: k keeps one forever, "
+                        "u brings back a forgotten one. /tidymemory runs it now."),
+    ],
     "4.6.0": [
         ("/editmemory", "Edit what ocode remembers. /editmemory coffee jumps straight to that memory; in /memory press "
                         "enter to edit, s to switch between you and this project, / to search."),
@@ -3075,6 +3234,9 @@ class SettingsScreen(ModalScreen):
                 yield Static("Auto-memory", classes="rowlabel")
                 yield Button(toggle_label(c["auto_memory"]), id="btn-automem")
             with Horizontal(classes="row"):
+                yield Static("Tidy memory", classes="rowlabel")
+                yield Button(toggle_label(c.get("memory_tidy", True)), id="btn-tidymem")
+            with Horizontal(classes="row"):
                 yield Button("Voice & microphone…", id="btn-voice")
                 yield Button("View memory…", id="btn-memory")
             with Horizontal(classes="row"):
@@ -3102,6 +3264,10 @@ class SettingsScreen(ModalScreen):
     @on(Button.Pressed, "#btn-automem")
     def _b(self):
         self._toggle("auto_memory", "#btn-automem")
+
+    @on(Button.Pressed, "#btn-tidymem")
+    def _tidy(self):
+        self._toggle("memory_tidy", "#btn-tidymem")
 
     @on(Button.Pressed, "#btn-voice")
     def _c(self):
@@ -3495,7 +3661,11 @@ HELP_TOPICS = [
      "ocode remembers useful facts about you and your projects between sessions.",
      [("/memory", "see, add, edit and delete what ocode remembers  (/memory <words> searches)"),
       ("/editmemory [words]", "edit a memory - with words, jumps to the one that matches"),
-      ("in /memory", "enter edit · s you/this project · d delete · a add · p add a project note · / search · c clear all"),
+      ("in /memory", "enter edit · k keep forever · s you/this project · d delete · a add · p add a project note · "
+                     "/ search · u undo a forget · c clear all"),
+      ("/tidymemory", "merge duplicate memories and forget unused learned ones now (on|off, days N)"),
+      ("tidying", "every few hours ocode merges clone memories and lets learned ones that haven't come up in 60 days "
+                  "fade. Ones you wrote, edited or kept never fade."),
       ("/remember <text>", "save a fact right now"),
       ("remember that ...", "say it in a normal message and ocode saves it"),
       ("auto-memory", "ocode also learns facts from your chats (switch it off in /settings)"),
@@ -4359,6 +4529,8 @@ class MemoryScreen(ModalScreen):
         Binding("e", "edit", show=False),
         Binding("s", "swap", show=False),
         Binding("slash", "find", show=False),
+        Binding("k", "keep", show=False),
+        Binding("u", "restore", show=False),
     ]
 
     def __init__(self, query="", edit_first=False):
@@ -4393,7 +4565,13 @@ class MemoryScreen(ModalScreen):
                 t.append(" you ", style=f"{BG} on {CYAN}")
             t.append("  " + f["text"], style=FG)
             when = time.strftime("%b %d", time.localtime(f.get("edited") or f["created"]))
-            right = Text(("edited " if f.get("edited") else "") + when, style=MUTED)
+            left_days = mem.fades_in(f, int(app.cfg.get("memory_forget_days") or 60))
+            if not app.cfg.get("memory_tidy", True) or left_days is None:
+                right = Text(("edited " if f.get("edited") else "") + when, style=MUTED)
+                if f.get("pinned"):
+                    right = Text.assemble(("● kept  ", GREEN), (when, MUTED))
+            else:
+                right = Text(f"fades in {plural(left_days, 'day')}", style=YELLOW if left_days <= 7 else MUTED)
             ol.add_option(Option(option_row(t, right), id=f["id"]))
         if not facts and self.query_text:
             ol.add_option(Option(Text(f"No memories match \"{self.query_text}\". Press / to search again.",
@@ -4414,7 +4592,8 @@ class MemoryScreen(ModalScreen):
             sw.update(Text("This session so far: " + summary[:350] + ("…" if len(summary) > 350 else ""), style=MUTED)
                       if summary else "")
         self.query_one("#mem-hint", Static).update(keys_hint(
-            ("enter", "edit"), ("s", "you/project"), ("d", "delete"), ("a", "add"), ("/", "search"), ("esc", "close"),
+            ("enter", "edit"), ("k", "keep"), ("d", "delete"), ("a", "add"), ("/", "search"),
+            ("u", "undo forget") if mem.forgotten else ("esc", "close"),
             warn="Press c again to ERASE ALL memories." if self._confirm_clear else None))
 
     def _current(self):
@@ -4461,6 +4640,35 @@ class MemoryScreen(ModalScreen):
             self.app.memory.update(fid, scope="user")
             self.app.notify("Now used everywhere.", title="Memory", timeout=3)
         self.refill(idx)
+
+    def action_keep(self):
+        fid, idx = self._current()
+        f = self.app.memory.get(fid) if fid else None
+        if not f:
+            return
+        on = not Memory.kept(f)
+        self.app.memory.set_pinned(fid, on)
+        self.app.notify("Kept - this memory won't fade." if on else "This memory will fade if it stops being needed.",
+                        title="Memory", timeout=3)
+        self.refill(idx)
+
+    def action_restore(self):
+        mem = self.app.memory
+        if not mem.forgotten:
+            self.app.notify("Nothing has been forgotten.", timeout=2)
+            return
+
+        def items():
+            return [(f["id"], f["text"][:60], f"{f.get('reason', '')} · "
+                     f"{time.strftime('%b %d', time.localtime(f.get('forgotten', 0)))}")
+                    for f in reversed(mem.forgotten)]
+
+        def chosen(fid):
+            if fid and mem.restore(fid):
+                self.app.notify("Brought back - it'll be kept from now on.", title="Memory", timeout=3)
+                self.refill()
+                self.app.refresh_chrome()
+        self.app.push_screen(ChoiceScreen("Forgotten memories - pick one to bring back", items, ""), chosen)
 
     def action_find(self):
         def done(v):
@@ -6193,6 +6401,8 @@ class OcodeApp(App):
         if self.cfg["discord_autostart"] and load_discord_token():
             self.discord_start(quiet=True)
         self.set_timer(4, self.auto_update_check)
+        self.set_timer(6, self.memory_tidy_check)
+        self.set_interval(6 * 3600, self.memory_tidy_check)
         self.mcp_start_all()
         if self.cfg.get("telegram_autostart") and load_telegram_token():
             self.telegram.start()
@@ -6953,7 +7163,7 @@ class OcodeApp(App):
         private_ok = tab.source != "discord" or tab.discord_owner_dm
         remote_memory = self.cfg["telegram_memory"] if getattr(tab, "platform", "") == "Telegram" else self.cfg["discord_memory"]
         if private_ok and (tab.source != "discord" or remote_memory):
-            block = memory_block(self.memory.relevant(tab.cwd, query))
+            block = memory_block(self.memory.relevant(tab.cwd, query, track=True))
             if block:
                 parts.append(block)
         if private_ok:
@@ -7000,9 +7210,37 @@ class OcodeApp(App):
         except Exception:
             return
         added = [t for t, scope in facts
-                 if self.memory.add(t, scope, cwd if scope == "project" else None)]
+                 if self.memory.add(t, scope, cwd if scope == "project" else None, source="auto")]
         if added:
             self.ui(self.memory_added, added)
+
+    def memory_tidy_check(self, force=False, report=False):
+        c = self.cfg
+        if not force and (not c.get("memory_tidy", True) or time.time() - c.get("last_memory_tidy", 0) < 6 * 3600):
+            return
+        c["last_memory_tidy"] = time.time()
+        save_settings(c)
+        days = int(c.get("memory_forget_days") or 60)
+
+        def work():
+            removed = self.memory.tidy(days)
+            self.ui(self.memory_tidied, removed, report)
+        threading.Thread(target=work, daemon=True).start()
+
+    def memory_tidied(self, removed, report=False):
+        self.refresh_chrome()
+        for scr in self.screen_stack:
+            if isinstance(scr, MemoryScreen):
+                scr.refill()
+        if not removed:
+            if report:
+                self.notify("Memory is already tidy - no duplicates or unused memories.", title="Memory")
+            return
+        dups = sum(1 for _, why in removed if why.startswith("duplicate"))
+        old = len(removed) - dups
+        bits = ([plural(dups, "duplicate")] if dups else []) + ([f"{old} no longer needed"] if old else [])
+        self.notify(f"Tidied memory: removed {' and '.join(bits)}.\nChanged your mind? /memory → u to bring one back.",
+                    title="Memory", timeout=8)
 
     def memory_added(self, added):
         self.refresh_chrome()
@@ -8628,6 +8866,20 @@ class OcodeApp(App):
             self.change_dir(arg)
         elif cmd in ("/memory", "/mem"):
             self.push_screen(MemoryScreen(query=arg.strip()))
+        elif cmd in ("/tidymemory", "/cleanmemory", "/tidymem"):
+            a = arg.strip().lower().split()
+            if a and a[0] in ("on", "off"):
+                self.cfg["memory_tidy"] = a[0] == "on"
+                save_settings(self.cfg)
+                self.notify(f"Automatic memory tidying {a[0]}.", title="Memory")
+            elif a and a[0] == "days" and len(a) > 1 and a[1].isdigit() and int(a[1]) >= 7:
+                self.cfg["memory_forget_days"] = int(a[1])
+                save_settings(self.cfg)
+                self.notify(f"Learned memories now fade after {a[1]} unused days.", title="Memory")
+            elif a:
+                self.notify("Usage: /tidymemory   ·   /tidymemory on|off   ·   /tidymemory days 90", title="Memory")
+            else:
+                self.memory_tidy_check(force=True, report=True)
         elif cmd in ("/editmemory", "/memedit", "/editmem", "/edit-memory"):
             q = arg.strip()
             if not self.memory.all():
@@ -8774,6 +9026,7 @@ class OcodeApp(App):
             # Memory
             ("memory", "Memory", "View memory…", "", f"{len(self.memory.facts)} saved"),
             ("editmemory", "Memory", "Edit a memory…", "", ""),
+            ("tidymemory", "Memory", "Tidy memory now", "", "auto" if c.get("memory_tidy", True) else "off"),
             ("remember", "Memory", "Add a memory…", "", ""),
             # Model & look
             ("model", "Model & look", "Choose model…", "", c["model"] or "none"),
@@ -8849,6 +9102,8 @@ class OcodeApp(App):
                 self.action_attach()
             elif cid == "speak":
                 self.set_speak(not self.cfg["speak"])
+            elif cid == "tidymemory":
+                self.slash("/tidymemory")
             elif cid == "editmemory":
                 self.slash("/editmemory")
             elif cid == "memory":
