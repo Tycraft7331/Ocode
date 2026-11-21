@@ -27,6 +27,7 @@ Keys
     ctrl+p     command palette (models, settings, voice, memory, ...)
     F1         help: every command and shortcut, searchable   (also /help)
     up / down  bring back messages you sent before            @file  include a file (tab completes it)
+    !command   run a shell command          /btw  side question          F2  switch to your last model
     ocode -c   start with the chat tabs from your last session  (or /resume inside ocode)
     ctrl+r     talk to ocode with your microphone (press again to send)
     ctrl+g     let ocode look at your screen (type a question first if you like)
@@ -72,6 +73,7 @@ import os
 import platform
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -109,13 +111,14 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
 GOOGLE_CREDS = CONFIG_DIR / "google_credentials.json"
 GOOGLE_TOKEN = CONFIG_DIR / "google_token.json"
 SESSION_FILE = CONFIG_DIR / "session.json"
+SESSIONS_DIR = CONFIG_DIR / "sessions"
 HISTORY_FILE = CONFIG_DIR / "prompt_history.jsonl"
 COMMANDS_DIR = CONFIG_DIR / "commands"
 MAX_STEPS = 15  # max tool rounds per message
@@ -246,6 +249,9 @@ DEFAULTS = {
     "update_check": True,        # look for a new version on GitHub once a day
     "update_repo": "",           # "" = the official repo (UPDATE_REPO below); or "owner/name"
     "last_update_check": 0,
+    "recent_models": [],         # newest first, for F2
+    "seen_version": "",          # to show "what's new" once after an update
+    "show_highlights": True,
 }
 
 # ---------------------------------------------------------------------------
@@ -1321,7 +1327,7 @@ def fetch_url_text(url, limit=15000):
 # ---------------------------------------------------------------------------
 # @file mentions, prompt commands
 # ---------------------------------------------------------------------------
-MENTION_RE = re.compile(r'(?<![\w@./\\])@("([^"\n]+)"|[^\s@"]+)')
+MENTION_RE = re.compile(r'(?<![\w@./\\])@("([^"\n]+)"|[^\s@"]+)(#\d+(?:-\d+)?)?')
 MENTION_MAX_BYTES = 60000
 
 
@@ -1339,20 +1345,33 @@ def expand_mentions(text, cwd, max_files=6, max_total=150000):
     Returns (text_to_add_for_the_model, [labels for the screen])."""
     blocks, labels, seen, total = [], [], set(), 0
     for m in MENTION_RE.finditer(text or ""):
-        raw = m.group(2) or m.group(1)
+        raw, rng = m.group(2) or m.group(1), m.group(3)
+        if not rng:  # @file.py#20-45 without quotes: the range is still inside raw
+            mm = re.match(r"^(.+?)(#\d+(?:-\d+)?)$", raw)
+            if mm:
+                raw, rng = mm.group(1), mm.group(2)
         p = _resolve_inside(cwd, raw)
         if p is None:
             trimmed = raw.rstrip(".,;:!?)]}'")
             p = _resolve_inside(cwd, trimmed) if trimmed != raw else None
-        if p is None or p in seen:
+        if p is None or (p, rng) in seen:
             continue
-        seen.add(p)
+        seen.add((p, rng))
         rel = p.relative_to(Path(cwd).resolve()).as_posix() if p != Path(cwd).resolve() else "."
         if p.is_dir():
             items = sorted(p.iterdir(), key=lambda q: (q.is_file(), q.name.lower()))
             listing = "\n".join(f"{q.name}{'/' if q.is_dir() else ''}" for q in items[:200])
             blocks.append(f"[Folder @{rel} contains:]\n{listing or '(empty)'}")
             labels.append(f"@{rel}/  ·  {len(items)} items")
+        elif rng and is_text_file(p, max_bytes=5_000_000):
+            lines = p.read_text(encoding="utf-8", errors="replace").splitlines()
+            nums = [int(x) for x in re.findall(r"\d+", rng)]
+            a = max(1, nums[0])
+            b = min(len(lines), max(a, nums[1] if len(nums) > 1 else nums[0]))
+            chunk = "\n".join(f"{i:>5}  {lines[i - 1]}" for i in range(a, b + 1)) if a <= len(lines) else ""
+            total += len(chunk)
+            blocks.append(f"[File @{rel} lines {a}-{b} of {len(lines)}:]\n```{p.suffix.lstrip('.')}\n{chunk}\n```")
+            labels.append(f"@{rel}#{a}-{b}  ·  {max(0, b - a + 1)} lines")
         elif is_text_file(p, max_bytes=5_000_000):
             data = p.read_text(encoding="utf-8", errors="replace")
             cut = data[:MENTION_MAX_BYTES]
@@ -1870,13 +1889,33 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
     "help": "keys shortcuts guide", "monitor": "cpu ram gpu temperature stats performance", "quit": "exit close",
     "newtab": "tab open", "tabs": "tab next previous", "closetab": "tab", "clear": "reset wipe",
     "agent": "build plan chat mode", "resume": "restore continue session", "export": "save markdown file",
-    "copy": "clipboard", "undo": "revert restore", "diff": "git changes status", "commit": "git save",
+    "copy": "clipboard", "undo": "revert restore back", "redo": "again forward", "sessions": "history past chats old",
+    "reopen": "closed tab restore", "compact": "summarize summary shrink context", "btw": "side question quick aside",
+    "editor": "notepad vim nano multiline write long", "recentmodel": "f2 previous model swap",
+    "highlights": "whats new release notes changelog", "diff": "git changes status", "commit": "git save",
     "cd": "directory folder path", "auto": "approve permissions allow", "prompts": "commands templates review fix",
     "discord": "bot", "google": "gmail calendar drive email", "attach": "image video picture photo file",
     "screen": "screenshot look see", "listen": "mic microphone talk voice speech", "speak": "voice tts audio",
     "voice": "mic microphone speech", "memory": "remember facts", "remember": "memory fact",
     "update": "upgrade new version github latest", "model": "ollama llm", "theme": "colour color dark light", "randomtheme": "colour color surprise",
     "logo": "gradient banner", "animations": "shimmer motion cursor", "settings": "options preferences config host",
+}
+
+
+WHATS_NEW = {
+    "4.2.0": [
+        ("/undo  /redo", "Undo now takes back your whole last message - the reply and every file change - and puts "
+                         "your text back in the prompt to edit. /redo brings it all back."),
+        ("!command", "Start a message with ! to run a shell command. The output stays in the chat so the AI sees it."),
+        ("/btw <question>", "Ask a quick side question in a popup without adding it to the conversation."),
+        ("/sessions", "Every chat is saved. Browse, search and reopen old ones. /reopen (ctrl+shift+t) brings "
+                      "back a tab you closed."),
+        ("Queue", "Press enter while the AI is working and your message waits its turn."),
+        ("Pastes & /editor", "Multi-line pastes are kept whole as a chip. /editor writes a long message in your editor."),
+        ("@file#20-45", "Send just those lines of a file. Type @ and press tab to search for a file."),
+        ("F2", "Switch back to the model you used before."),
+        ("/compact", "Summarize a long conversation now to free up the model's memory."),
+    ],
 }
 
 
@@ -2556,6 +2595,12 @@ HELP_TOPICS = [
       ("/help  or  F1", "this help (type a word to search it)"),
       ("esc", "stop the AI while it is working (also stops speech and cancels recording)"),
       ("/settings", "Ollama address, temperature, context size, auto-approve"),
+      ("!command", "run a shell command yourself (e.g. !git status) - the output stays in the chat for the AI"),
+      ("/btw <question>", "ask a quick side question in a popup - it isn't added to the chat"),
+      ("enter while it works", "queues your message - it's sent as soon as the current reply finishes"),
+      ("/editor", "write a long message in your text editor (uses EDITOR, or Notepad on Windows)"),
+      ("F2", "switch back to the model you used before"),
+      ("/highlights", "what's new in this version"),
       ("/update", "update ocode to the newest version on GitHub (/update check only looks)"),
       ("/exit  or  ctrl+q", "quit ocode")]),
     ("agents", "Agents: Build, Plan, Chat",
@@ -2574,7 +2619,12 @@ HELP_TOPICS = [
       ("/tab N  or  /tabs", "jump to tab N, or pick one from a list"),
       ("ctrl+w  or  /close", "close the tab (ctrl+w only works when the prompt is empty)"),
       ("/rename <name>", "rename the tab"),
-      ("/clear", "wipe this tab's conversation but keep the tab"),
+      ("/clear", "start this tab fresh (the old chat stays in /sessions)"),
+      ("/sessions", "browse, search and reopen every chat you've had"),
+      ("/reopen  or  ctrl+shift+t", "bring back the tab you just closed"),
+      ("/undo", "take back your last message, its reply and its file changes - your text comes back to edit"),
+      ("/redo", "bring back what /undo took"),
+      ("/compact", "summarize a long chat now to free up the model's memory"),
       ("click", "click a tab to switch, x to close it, + for a new one")]),
     ("see", "Images, videos and your screen",
      "Needs a vision model (ollama pull qwen2.5vl:7b). Videos also need: python -m pip install av",
@@ -2600,8 +2650,9 @@ HELP_TOPICS = [
      "Shortcuts for everyday coding. In Build and Plan, ocode can also search your whole project and read web pages "
      "(it asks before opening a page).",
      [("@file", "type @ and a file or folder name to put its contents in your message (tab completes the name)"),
+      ("@file#20-45", "send only lines 20-45 of a file"),
+      ("@ then tab", "search every file in the project"),
       ("up / down", "bring back messages you sent before"),
-      ("/undo", "undo the last file change ocode made in this tab (run it again to go further back)"),
       ("/diff", "show what has changed in your git repository"),
       ("/commit [message]", "commit everything; ocode writes the message for you if you leave it out"),
       ("/review", "review your uncommitted changes for bugs (doesn't change anything)"),
@@ -2755,6 +2806,260 @@ class HelpScreen(ModalScreen):
 
     def action_cursor_up(self):
         self.query_one("#help-list", OptionList).action_cursor_up()
+
+    def action_close(self):
+        self.dismiss(None)
+
+
+class FilePickerScreen(ModalScreen):
+    """@ + tab: search every file in the project."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("down", "down", show=False), Binding("up", "up", show=False)]
+
+    def __init__(self, cwd, query=""):
+        super().__init__()
+        self.cwd, self.initial = cwd, query
+        self.files = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="picker"):
+            with Horizontal(id="palette-head"):
+                yield Static(Text("Find a file", style="bold"), id="palette-title")
+                yield Static("", id="palette-count")
+            yield Input(self.initial, placeholder="Type part of a file name…", id="picker-input")
+            yield OptionList(id="picker-list")
+            yield Static(Text.assemble(("enter", f"bold {FG2}"), (" insert @file   ", MUTED), ("esc", f"bold {FG2}"),
+                                       (" close", MUTED)), classes="hint")
+
+    def on_mount(self):
+        self.query_one("#picker-list", OptionList).add_option(Option(Text("Looking through the project…", style=MUTED),
+                                                                     disabled=True))
+        self.query_one("#picker-input", Input).focus()
+        self.run_worker(self._load, thread=True, exit_on_error=False)
+
+    def _load(self):
+        root = Path(self.cwd)
+        files = [p.relative_to(root).as_posix() for p in iter_project_files(root, limit=8000)]
+        try:
+            self.app.call_from_thread(self._loaded, files)
+        except Exception:
+            pass
+
+    def _loaded(self, files):
+        self.files = files
+        self.refill(self.query_one("#picker-input", Input).value)
+
+    def refill(self, q):
+        ol = self.query_one("#picker-list", OptionList)
+        ol.clear_options()
+        scored = []
+        for rel in self.files:
+            sc = fuzzy_file_score(q.strip().replace("\\", "/"), rel)
+            if sc is not None:
+                scored.append((-sc, rel.lower(), rel))
+        scored.sort()
+        for _, _, rel in scored[:150]:
+            head, _, name = rel.rpartition("/")
+            t = highlight_matches(name, q.strip().rsplit("/", 1)[-1], f"bold {FG}", f"bold {ACCENT}")
+            if head:
+                t.append("   " + head + "/", style=MUTED)
+            ol.add_option(Option(t, id=rel))
+        if not scored:
+            ol.add_option(Option(Text("No file matches." if self.files else "This folder has no files.", style=MUTED),
+                                 disabled=True))
+        else:
+            ol.highlighted = 0
+        self.query_one("#palette-count", Static).update(
+            Text(f"{len(scored)} of {len(self.files)}", style=MUTED, justify="right"))
+
+    @on(Input.Changed, "#picker-input")
+    def _changed(self, e):
+        if self.files:
+            self.refill(e.value)
+
+    @on(Input.Submitted, "#picker-input")
+    def _submitted(self, e):
+        ol = self.query_one("#picker-list", OptionList)
+        if ol.highlighted is not None and not ol.get_option_at_index(ol.highlighted).disabled:
+            self.dismiss(ol.get_option_at_index(ol.highlighted).id)
+
+    @on(OptionList.OptionSelected)
+    def _selected(self, e):
+        self.dismiss(e.option.id)
+
+    def action_down(self):
+        self.query_one("#picker-list", OptionList).action_cursor_down()
+
+    def action_up(self):
+        self.query_one("#picker-list", OptionList).action_cursor_up()
+
+    def action_close(self):
+        self.dismiss(None)
+
+
+class SessionsScreen(ModalScreen):
+    """/sessions: every saved chat, newest first. Type to search; enter reopens; ctrl+d deletes."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("down", "down", show=False),
+                Binding("up", "up", show=False), Binding("ctrl+d", "delete", show=False, priority=True)]
+
+    def __init__(self, open_ids):
+        super().__init__()
+        self.open_ids = open_ids
+        self.sessions = list_sessions()
+        self.confirm_delete = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="picker"):
+            with Horizontal(id="palette-head"):
+                yield Static(Text("Sessions", style="bold"), id="palette-title")
+                yield Static("", id="palette-count")
+            yield Input(placeholder="Search your past chats…", id="sessions-input")
+            yield OptionList(id="sessions-list")
+            yield Static("", id="sessions-hint", classes="hint")
+
+    def on_mount(self):
+        self.refill("")
+        self.query_one("#sessions-input", Input).focus()
+
+    def refill(self, q):
+        ol = self.query_one("#sessions-list", OptionList)
+        ol.clear_options()
+        shown = 0
+        for d in self.sessions:
+            title = d.get("title") or "Untitled chat"
+            hay = f"{title} {d.get('cwd') or ''}".lower()
+            if q and not all(w in hay for w in q.lower().split()):
+                continue
+            grid = Table.grid(expand=True, padding=(0, 1))
+            grid.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+            grid.add_column(justify="right", no_wrap=True, max_width=46, overflow="ellipsis")
+            name = highlight_matches(title, q, f"bold {FG}", f"bold {ACCENT}") if q else Text(title, style=f"bold {FG}")
+            if d.get("id") in self.open_ids:
+                name = Text.assemble(("● ", GREEN), name)
+            info = Text(f"{d.get('messages') or 0} msg · {short_path(d.get('cwd') or '')} · {ago(d.get('updated'))}",
+                        style=MUTED)
+            grid.add_row(name, info)
+            ol.add_option(Option(grid, id=d["id"]))
+            shown += 1
+        if not shown:
+            ol.add_option(Option(Text("No saved chats yet - they're kept automatically as you talk to ocode."
+                                      if not self.sessions else "Nothing matches.", style=MUTED), disabled=True))
+        else:
+            ol.highlighted = 0
+        self.query_one("#palette-count", Static).update(
+            Text(f"{shown} of {len(self.sessions)}" if q else f"{len(self.sessions)} saved", style=MUTED, justify="right"))
+        self.set_hint()
+
+    def set_hint(self, warn=None):
+        k = lambda key, label: [(key, f"bold {FG2}"), (" " + label + "   ", MUTED)]
+        if warn:
+            self.query_one("#sessions-hint", Static).update(Text(warn, style=f"bold {RED}"))
+        else:
+            self.query_one("#sessions-hint", Static).update(Text.assemble(
+                *k("enter", "open"), *k("ctrl+d", "delete"), *k("●", "open in a tab"), *k("esc", "close")))
+
+    @on(Input.Changed, "#sessions-input")
+    def _changed(self, e):
+        self.confirm_delete = None
+        self.refill(e.value)
+
+    @on(Input.Submitted, "#sessions-input")
+    def _submitted(self, e):
+        ol = self.query_one("#sessions-list", OptionList)
+        if ol.highlighted is not None and not ol.get_option_at_index(ol.highlighted).disabled:
+            self.dismiss(ol.get_option_at_index(ol.highlighted).id)
+
+    @on(OptionList.OptionSelected)
+    def _selected(self, e):
+        self.dismiss(e.option.id)
+
+    def action_delete(self):
+        ol = self.query_one("#sessions-list", OptionList)
+        if ol.highlighted is None or ol.get_option_at_index(ol.highlighted).disabled:
+            return
+        sid = ol.get_option_at_index(ol.highlighted).id
+        if self.confirm_delete != sid:
+            self.confirm_delete = sid
+            self.set_hint("Press ctrl+d again to delete this chat for good.")
+            return
+        try:
+            (SESSIONS_DIR / f"{sid}.json").unlink()
+        except OSError:
+            pass
+        self.confirm_delete = None
+        self.sessions = [d for d in self.sessions if d["id"] != sid]
+        self.refill(self.query_one("#sessions-input", Input).value)
+
+    def action_down(self):
+        self.confirm_delete = None
+        self.set_hint()
+        self.query_one("#sessions-list", OptionList).action_cursor_down()
+
+    def action_up(self):
+        self.confirm_delete = None
+        self.set_hint()
+        self.query_one("#sessions-list", OptionList).action_cursor_up()
+
+    def action_close(self):
+        self.dismiss(None)
+
+
+class BtwScreen(ModalScreen):
+    """/btw <question>: a side answer in a popup. Nothing is added to the conversation."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("c", "copy", show=False)]
+
+    def __init__(self, question, tab):
+        super().__init__()
+        self.question, self.tab = question, tab
+        self.answer = ""
+        self.closed = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="btw"):
+            yield Static(Text.assemble(("By the way  ", "bold"), ("(not added to the chat)", MUTED)), classes="title")
+            yield Static(Text.assemble(("┃ ", ACCENT), (self.question, FG), style=f"on {PANEL2}"), id="btw-q")
+            with VerticalScroll(id="btw-scroll"):
+                yield Static(Text("thinking…", style=MUTED), id="btw-answer")
+            yield Static(Text.assemble(("c", f"bold {FG2}"), (" copy answer   ", MUTED), ("esc", f"bold {FG2}"),
+                                       (" close", MUTED)), classes="hint")
+
+    def on_mount(self):
+        self.app.run_worker(lambda: self.app.btw_worker(self, self.question, self.tab), thread=True, exit_on_error=False)
+
+    def set_answer(self, text, final=False):
+        self.answer = text
+        if not self.closed:
+            self.query_one("#btw-answer", Static).update(md(text + ("" if final else " ▍")) if text else
+                                                          Text("thinking…", style=MUTED))
+
+    def action_copy(self):
+        if self.answer:
+            self.app.copy_text(self.answer)
+            self.app.notify("Copied the answer.", timeout=2)
+
+    def action_close(self):
+        self.closed = True
+        self.dismiss(None)
+
+
+class HighlightsScreen(ModalScreen):
+    """What's new in this version (shown once after an update, or with /highlights)."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("enter", "close", show=False)]
+
+    def compose(self) -> ComposeResult:
+        ver = VERSION if VERSION in WHATS_NEW else (sorted(WHATS_NEW, key=parse_version)[-1] if WHATS_NEW else VERSION)
+        with Vertical(id="dialog", classes="btw"):
+            yield Static(Text.assemble(("What's new in ocode ", "bold"), (ver, f"bold {ACCENT}")), classes="title")
+            body = Table.grid(padding=(0, 2))
+            body.add_column(no_wrap=True, style=f"bold {FG}")
+            body.add_column(ratio=1, style=FG2)
+            for key, desc in WHATS_NEW.get(ver, []):
+                body.add_row(key, desc)
+                body.add_row("", "")
+            with VerticalScroll(id="btw-scroll"):
+                yield Static(body)
+            yield Static(Text.assemble(("enter", f"bold {FG2}"), (" close   ", MUTED), ("F1", f"bold {FG2}"),
+                                       (" all commands   ", MUTED), ("/highlights", f"bold {FG2}"),
+                                       (" shows this again", MUTED)), classes="hint")
 
     def action_close(self):
         self.dismiss(None)
@@ -2996,6 +3301,11 @@ BARS = "▁▂▃▄▅▆▇█"
 
 
 TIPS = [
+    "Start a message with ! to run a shell command - e.g. !git status",
+    "/btw asks a side question without cluttering the chat",
+    "Every chat is saved - /sessions brings back old ones",
+    "Closed a tab by mistake? ctrl+shift+t reopens it",
+    "/undo takes back your last message and its file changes - /redo brings them back",
     "Type @ and a file name to show ocode a file - press tab to complete it",
     "Changed your mind? /undo puts back the last file ocode edited",
     "/commit writes the git commit message for you",
@@ -4062,6 +4372,78 @@ def video_transcript(path, cfg, max_seconds=600, on_status=None):
     return text if len(text) <= 6000 else text[:6000] + "\n…(transcript truncated)"
 
 
+def new_session_id():
+    return time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+
+
+def save_session_file(tab):
+    """Every local chat is kept in ~/.ocode/sessions so /sessions can bring it back later."""
+    if tab.source != "local" or not tab.history:
+        return
+    data = {"id": tab.session_id, "title": tab.title, "cwd": tab.cwd, "agent": tab.agent, "summary": tab.summary,
+            "created": tab.created, "updated": time.time(),
+            "messages": sum(1 for m in tab.history if m["role"] == "user" and not m["content"].startswith(("<tool_result", "[Note"))),
+            "history": history_for_save(tab.history)}
+    try:
+        SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+        f = SESSIONS_DIR / f"{tab.session_id}.json"
+        tmp = f.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, f)
+        files = sorted(SESSIONS_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime)
+        for old in files[:-300]:  # keep the newest 300
+            old.unlink()
+    except Exception:
+        pass
+
+
+def list_sessions():
+    out = []
+    try:
+        files = list(SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return out
+    for f in files:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+            out.append({k: d.get(k) for k in ("id", "title", "cwd", "updated", "messages")})
+        except Exception:
+            continue
+    return sorted(out, key=lambda d: d.get("updated") or 0, reverse=True)
+
+
+def load_session(sid):
+    try:
+        return json.loads((SESSIONS_DIR / f"{sid}.json").read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def ago(ts):
+    d = max(0, time.time() - (ts or 0))
+    for size, unit in ((86400 * 7, "w"), (86400, "d"), (3600, "h"), (60, "m")):
+        if d >= size:
+            return f"{int(d // size)}{unit} ago"
+    return "just now"
+
+
+def fuzzy_file_score(q, rel):
+    q, rel_l = q.lower(), rel.lower()
+    name = rel_l.rsplit("/", 1)[-1]
+    if not q:
+        return 1.0
+    if name.startswith(q):
+        return 10 - len(name) / 100
+    if q in name:
+        return 8 - len(name) / 100
+    if q in rel_l:
+        return 6 - len(rel_l) / 200
+    it = iter(rel_l)
+    if all(ch in it for ch in q):
+        return 2 - len(rel_l) / 200
+    return None
+
+
 class PromptInput(Input):
     """The prompt box. Pasting or dropping image files attaches them instead of typing the path.
     up / down walk through what you sent before; tab completes an @file mention."""
@@ -4095,14 +4477,10 @@ class PromptInput(Input):
             event.stop()
             partial = m.group(2)
             options = complete_mention(partial, app.cur_tab.cwd)
-            if not options:
-                app.notify(f"No file or folder starts with “{partial}” here.", severity="warning", timeout=3)
-                return
-            common = os.path.commonprefix(options)
-            if len(options) > 1 and len(common) <= len(partial):
-                shown = "  ".join(o.rsplit("/", 2)[-2] + "/" if o.endswith("/") else o.rsplit("/", 1)[-1]
-                                  for o in options[:12])
-                app.notify(shown + ("  …" if len(options) > 12 else ""), title="Matches", timeout=5)
+            common = os.path.commonprefix(options) if options else ""
+            if not options or (len(options) > 1 and len(common) <= len(partial)):
+                start = len(before) - len(partial) - len(m.group(1))
+                app.open_file_picker(partial, start, self.cursor_position)  # search the whole project instead
                 return
             choice = options[0] if len(options) == 1 else common
             quote = m.group(1) or ('"' if " " in choice else "")
@@ -4118,6 +4496,10 @@ class PromptInput(Input):
         paths = image_paths_only(event.text, self.app.cur_tab.cwd)
         if paths:
             self.app.attach_paths(paths)
+            event.prevent_default()
+            event.stop()
+        elif "\n" in event.text.strip():  # the prompt is one line: keep multi-line pastes whole, as a chip
+            self.app.add_pasted_text(event.text)
             event.prevent_default()
             event.stop()
 
@@ -4195,6 +4577,14 @@ class ChatTab:
         self.pending_cf = None     # future that carries the finished reply back to Discord
         self.pending_images = []   # images attached to the next message
         self.undo = []             # file changes ocode made here, newest last (for /undo)
+        self.turns = []            # your messages here: where each starts, for /undo and /redo
+        self.redo = []             # what /undo took back, for /redo
+        self.turn_seq = 0
+        self.cur_turn = None       # id of the message being worked on
+        self.queue = []            # messages typed while the AI was busy
+        self.pending_text = ""     # a multi-line paste (or /editor text) waiting to be sent
+        self.session_id = new_session_id()
+        self.created = time.time()
         self.turn_started = 0.0    # when the current reply started (long ones ring the bell)
         self.view = None           # the scrolling message area (set by the app)
 
@@ -4219,7 +4609,8 @@ class ToolEnv:
 
     def record_change(self, path, before, after):
         """Remembers what a file looked like before ocode changed it, so /undo can put it back."""
-        self._tab.undo.append({"path": str(path), "old": before, "new": after, "when": time.time()})
+        self._tab.undo.append({"path": str(path), "old": before, "new": after, "when": time.time(),
+                               "turn": self._tab.cur_turn})
         del self._tab.undo[:-50]
 
 
@@ -4339,6 +4730,17 @@ class OcodeApp(App):
                   scrollbar-background: $oc-panel; scrollbar-color: $oc-panel2; }
     #theme-preview { width: 1fr; height: 100%; padding: 1 2; background: $oc-bg; overflow-y: auto; }
     #theme-hint { margin-top: 1; height: auto; }
+    #dialog.picker { width: 92; max-width: 96%; height: 80%; padding: 1 2; }
+    #picker-input, #sessions-input { margin-bottom: 1; }
+    #picker-list, #sessions-list { height: 1fr; max-height: 100%; scrollbar-size-vertical: 1; scrollbar-background: $oc-panel;
+                                   scrollbar-color: $oc-panel2; }
+    #picker-list > .option-list--option-highlighted, #sessions-list > .option-list--option-highlighted
+        { background: $oc-hover; color: $oc-fg; text-style: none; }
+    #picker-list:focus > .option-list--option-highlighted, #sessions-list:focus > .option-list--option-highlighted
+        { background: $oc-hover; color: $oc-fg; text-style: none; }
+    #dialog.btw { width: 96; max-width: 96%; height: auto; max-height: 85%; padding: 1 2; }
+    #btw-q { margin-bottom: 1; padding: 0 1; }
+    #btw-scroll { height: auto; max-height: 30; }
     #dialog.palette { width: 92; max-width: 96%; height: 80%; padding: 1 2; }
     #palette-head { height: 1; margin-bottom: 1; }
     #palette-title { width: 1fr; }
@@ -4392,6 +4794,8 @@ class OcodeApp(App):
         Binding("ctrl+o", "attach", "Attach image", priority=True),
         Binding("f1", "help", "Help", priority=True),
         Binding("ctrl+t", "new_tab", "New tab", priority=True),
+        Binding("ctrl+shift+t", "reopen_tab", "Reopen tab", priority=True),
+        Binding("f2", "recent_model", "Recent model", priority=True),
         Binding("ctrl+w", "close_tab", "Close tab", priority=True),
         Binding("alt+right", "next_tab", "Next tab", priority=True),
         Binding("alt+left", "prev_tab", "Previous tab", priority=True),
@@ -4414,6 +4818,8 @@ class OcodeApp(App):
         self.initial_prompt = initial_prompt
         self.resume = resume
         self.prompt_history = load_prompt_history()
+        self.closed_sessions = []   # for /reopen
+        self._shell_mode = False
         self.hist_pos = None
         self.hist_draft = ""
         if self.cfg.get("theme") not in PALETTES:
@@ -4488,6 +4894,13 @@ class OcodeApp(App):
         if self.cfg["discord_autostart"] and load_discord_token():
             self.discord_start(quiet=True)
         self.set_timer(4, self.auto_update_check)
+        self.note_recent_model(self.cfg.get("model"), save=False)
+        seen = self.cfg.get("seen_version") or ""
+        if seen != VERSION:
+            self.cfg["seen_version"] = VERSION
+            save_settings(self.cfg)
+            if seen and self.cfg.get("show_highlights", True) and VERSION in WHATS_NEW:
+                self.set_timer(1.5, self.open_highlights)
         self.query_one("#sysmon").display = self.cfg["monitor"]
         self.monitor.set_fast(self.cfg["monitor"])
         self.monitor.start()
@@ -4510,7 +4923,14 @@ class OcodeApp(App):
         if self.transcribing or self.busy:
             t.append(SPIN[self.spin % len(SPIN)] + " ", style=ACCENT)
             t.append((self.mic_activity if self.transcribing else self.activity) or "working…", style="bold")
-            t.append("   esc to interrupt", style=MUTED)
+            if self.cur_tab.queue:
+                t.append(f"   {len(self.cur_tab.queue)} queued", style=f"bold {YELLOW}")
+            t.append("   esc to interrupt" + ("  ·  enter queues another message" if self.busy else ""), style=MUTED)
+            return t
+        if self._shell_mode:
+            t.append("$ Shell", style=f"bold {CYAN}")
+            t.append(f"  runs in {short_path(self.cur_tab.cwd)}  ·  enter to run  ·  the output stays in the chat",
+                     style=MUTED)
             return t
         ag = self.cur_tab.agent
         t.append(AGENT_LABEL[ag], style="bold " + agent_color(ag))
@@ -4562,7 +4982,8 @@ class OcodeApp(App):
         except Exception:
             return  # the screen is going away (shutting down)
         try:  # the prompt's left edge shows the mode: Build / Plan / Chat
-            self.query_one("#promptbox").styles.border_left = ("outer", agent_color(self.cur_tab.agent))
+            self.query_one("#promptbox").styles.border_left = (
+                "outer", CYAN if self._shell_mode else agent_color(self.cur_tab.agent))
         except Exception:
             pass
         status.update(self.status_text())
@@ -4785,6 +5206,9 @@ class OcodeApp(App):
         def do_close():
             if tab not in self.tabs:
                 return
+            if tab.source == "local" and tab.history:
+                save_session_file(tab)
+                self.closed_sessions.append(tab.session_id)
             tab.closed = True
             tab.stop.set()
             for _text, _shown, qcf, _imgs in tab.discord_queue:
@@ -4808,12 +5232,17 @@ class OcodeApp(App):
 
         if confirm and (tab.started or tab.busy):
             self.push_screen(
-                ConfirmScreen("Close this chat tab?", f"“{tab.label}” and its conversation will be discarded."),
+                ConfirmScreen("Close this chat tab?", f"“{tab.label}” stays in /sessions - /reopen (ctrl+shift+t) "
+                                                      "brings it straight back."),
                 lambda ok: do_close() if ok else None)
         else:
             do_close()
 
     def clear_tab(self, tab):
+        save_session_file(tab)  # the old chat stays in /sessions
+        tab.session_id, tab.created = new_session_id(), time.time()
+        tab.turns, tab.redo, tab.undo, tab.queue = [], [], [], []
+        tab.pending_text = ""
         tab.stop.set()
         if tab is self.cur_tab:
             self.speaker.stop()
@@ -4827,7 +5256,8 @@ class OcodeApp(App):
         tab.view.remove_children()
         self.show_active_view()
         self.refresh_chrome()
-        self.notify("Chat cleared. Long-term memory is kept.")
+        self.refresh_attach()
+        self.notify("Chat cleared - the old one is still in /sessions. Long-term memory is kept.")
 
     def rename_tab(self, name):
         name = " ".join((name or "").split())[:40]
@@ -4935,6 +5365,7 @@ class OcodeApp(App):
     def finish_turn(self, tab):
         tab.busy = False
         tab.activity = ""
+        tab.cur_turn = None
         if tab.closed:
             return
         if tab is not self.cur_tab:
@@ -4946,9 +5377,25 @@ class OcodeApp(App):
         if tab is self.cur_tab:
             self.query_one("#prompt", Input).focus()
         self.session_save()
+        save_session_file(tab)
         self.discord_pump(tab)
+        if tab.queue and not tab.busy:
+            item = tab.queue.pop(0)
+            try:
+                item["widget"].remove()
+            except Exception:
+                pass
+            self.send_message(item["text"], shown=item["shown"], tab=tab, images=item["images"],
+                              restore=item.get("restore"))
 
     # ----- sending messages -----
+    @on(Input.Changed, "#prompt")
+    def _prompt_changed(self, event):
+        shell = event.value.startswith("!")
+        if shell != self._shell_mode:
+            self._shell_mode = shell
+            self.refresh_chrome()
+
     @on(Input.Submitted, "#prompt")
     def _submit(self, event):
         text = event.value.strip()
@@ -4962,17 +5409,42 @@ class OcodeApp(App):
             event.input.value = ""
             self.slash(text)
             return
+        if text.startswith("!"):
+            if len(text) > 1 and self.run_shell(tab, text[1:].strip()):
+                event.input.value = ""
+            return
         paths = image_paths_only(text, tab.cwd)
         if paths:  # a dropped / pasted image path: attach it, send on the next enter
             self.attach_paths(paths)
             event.input.value = ""
             return
-        if not text and not tab.pending_images:
+        if not text and not tab.pending_images and not tab.pending_text:
             return
-        if self.send_message(text or DEFAULT_IMAGE_PROMPT):
+        paste = tab.pending_text
+        full = "\n\n".join(x for x in (text, paste) if x) or DEFAULT_IMAGE_PROMPT
+        shown = None
+        if paste:
+            n = paste.count("\n") + 1
+            shown = (text + "\n" if text else "") + f"▤ pasted {n} line{'s' if n != 1 else ''}"
+        if tab.busy:  # the AI is still working: this message waits its turn
+            if tab.source != "local":
+                return
+            imgs = list(tab.pending_images)
+            tab.pending_images.clear()
+            tab.pending_text = ""
+            self.refresh_attach()
+            w = self.add_widget(Static(Text.assemble(("⏳ queued  ", f"bold {YELLOW}"),
+                                                     ((shown or full)[:300], MUTED)), classes="info"), tab)
+            tab.queue.append({"text": full, "shown": shown, "images": imgs, "widget": w, "restore": (text, paste)})
+            event.input.value = ""
+            self.refresh_chrome()
+            return
+        if self.send_message(full, shown=shown, restore=(text, paste)):
+            tab.pending_text = ""
+            self.refresh_attach()
             event.input.value = ""
 
-    def send_message(self, text, attach_screen=False, shown=None, tab=None, images=None):
+    def send_message(self, text, attach_screen=False, shown=None, tab=None, images=None, restore=None):
         """Starts an AI turn in a tab. Returns True if the message was sent.
         images=None sends whatever is attached to the tab; a list (Discord) sends exactly those."""
         tab = tab or self.cur_tab
@@ -5001,6 +5473,11 @@ class OcodeApp(App):
         if not tab.title:
             tab.title = " ".join((shown or text).split())[:30]
         extra, mentions = expand_mentions(text, tab.cwd) if tab.source == "local" else ("", [])
+        tab.turn_seq += 1
+        tab.turns.append({"id": tab.turn_seq, "hist_start": len(tab.history), "view_start": len(tab.view.children),
+                          "restore": restore or (shown or text, "")})
+        tab.cur_turn = tab.turn_seq
+        tab.redo.clear()  # a new message accepts what was undone
         body = Text(shown or text)
         if mentions:
             body = Group(body, Text("\n" + "\n".join("▤ " + m for m in mentions), style=MUTED))
@@ -5142,6 +5619,7 @@ class OcodeApp(App):
             folded.append(msgs.pop(0))
         while len(msgs) > 1 and msgs[0]["role"] != "user":
             folded.append(msgs.pop(0))
+        self.shift_turns(tab, len(folded))
         self.ui(self.set_activity, tab, "summarizing earlier conversation…")
         try:
             s = summarize(cfg, tab.summary, folded)
@@ -5302,6 +5780,425 @@ class OcodeApp(App):
         if self.send_message(q or default, attach_screen=True, shown=q or "Look at my screen"):
             prompt.value = ""
 
+    # ----- OpenCode-style: undo/redo whole messages, shell, /btw, sessions, editor, recent models -----
+    def shift_turns(self, tab, n):
+        """The oldest n messages were folded into a summary: keep /undo pointing at the right places."""
+        if not n:
+            return
+        for t in tab.turns:
+            t["hist_start"] -= n
+        tab.turns = [t for t in tab.turns if t["hist_start"] >= 0]
+        ids = {t["id"] for t in tab.turns}
+        tab.undo = [r for r in tab.undo if r.get("turn") is None or r.get("turn") in ids]
+        tab.redo.clear()
+
+    def _files_differ(self, recs, side):
+        """Paths whose current content isn't what the records say it should be (side: 'new' or 'old')."""
+        latest = {}
+        for r in (recs if side == "new" else reversed(recs)):
+            latest[r["path"]] = r  # last write for 'new', first write for 'old'
+        out = []
+        for path, r in latest.items():
+            p = Path(path)
+            now = p.read_bytes() if p.is_file() else None
+            if now != r[side]:
+                out.append(path)
+        return out
+
+    def _write_state(self, recs, side):
+        order = reversed(recs) if side == "old" else recs
+        for r in order:
+            p = Path(r["path"])
+            data = r[side]
+            if data is None:
+                if p.exists():
+                    p.unlink()
+            else:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_bytes(data)
+
+    def undo_last(self, force=False):
+        """Takes back your last message: the reply, every file change it made, and puts your text back."""
+        tab = self.cur_tab
+        if tab.busy:
+            self.notify("Wait until this tab has finished (or press esc), then undo.", severity="warning")
+            return
+        if tab.undo and tab.undo[-1].get("turn") not in {t["id"] for t in tab.turns}:  # a change outside any message
+            return self._undo_single_file(tab, force)
+        if not tab.turns:
+            self.notify("Nothing to undo in this tab.", title="Undo", timeout=4)
+            return
+        turn = tab.turns[-1]
+        recs = [r for r in tab.undo if r.get("turn") == turn["id"]]
+        changed = self._files_differ(recs, "new")
+        if changed and not force:
+            names = ", ".join(short_path(p) for p in changed[:3])
+            self.push_screen(ConfirmScreen("Some files changed after ocode edited them.",
+                                           f"{names}\nUndo anyway? Your later changes to them would be lost."),
+                             lambda ok: self.undo_last(force=True) if ok else None)
+            return
+        try:
+            self._write_state(recs, "old")
+        except OSError as e:
+            self.notify(f"Couldn't undo: {e}", severity="error")
+            return
+        removed = tab.history[turn["hist_start"]:]
+        del tab.history[turn["hist_start"]:]
+        for w in list(tab.view.children)[turn["view_start"]:]:
+            w.remove()
+        tab.turns.pop()
+        tab.undo = [r for r in tab.undo if r.get("turn") != turn["id"]]
+        typed, paste = turn.get("restore") or ("", "")
+        nfiles = len({r["path"] for r in recs})
+        info = Static(Text.assemble(("↶ undone  ", f"bold {YELLOW}"),
+                                    (f"{(typed or 'your message')[:80]}" + (f"  ·  {nfiles} file(s) put back" if nfiles else "")
+                                     + "  ·  /redo brings it back", MUTED)), classes="info")
+        self.add_widget(info, tab)
+        tab.redo.append({"turn": turn, "history": removed, "files": recs, "info": info})
+        if tab is self.cur_tab and tab.source == "local":
+            prompt = self.query_one("#prompt", Input)
+            if not prompt.value.strip():
+                prompt.value = typed
+                prompt.cursor_position = len(typed)
+            if paste and not tab.pending_text:
+                tab.pending_text = paste
+            self.refresh_attach()
+        save_session_file(tab)
+        self.session_save()
+        self.notify("Undid your last message" + (f" and {nfiles} file change(s)" if nfiles else "")
+                    + ". Edit and resend it, or /redo.", title="Undo", timeout=5)
+
+    def _undo_single_file(self, tab, force=False):
+        rec = tab.undo[-1]
+        p = Path(rec["path"])
+        now = p.read_bytes() if p.is_file() else None
+        if now != rec["new"] and not force:
+            self.push_screen(ConfirmScreen(f"{short_path(p)} changed after ocode edited it.",
+                                           "Undo anyway? Changes made since then would be lost."),
+                             lambda ok: self.undo_last(force=True) if ok else None)
+            return
+        tab.undo.pop()
+        try:
+            self._write_state([rec], "old")
+        except OSError as e:
+            self.notify(f"Couldn't undo: {e}", severity="error")
+            return
+        try:
+            rel = p.relative_to(Path(tab.cwd).resolve()).as_posix()
+        except ValueError:
+            rel = short_path(p)
+        what = "deleted the file ocode created" if rec["old"] is None else "restored the previous version"
+        tab.history.append({"role": "user", "content": f"[Note: the user undid your change to {rel} ({what}).]"})
+        self.add_widget(ToolCard(f"undo {rel}", what, "", "ok"), tab)
+        self.notify(f"Undid the change to {rel}.", title="Undo", timeout=3)
+
+    def redo_last(self, force=False):
+        tab = self.cur_tab
+        if tab.busy:
+            self.notify("Wait until this tab has finished, then redo.", severity="warning")
+            return
+        if not tab.redo:
+            self.notify("Nothing to redo.", title="Redo", timeout=3)
+            return
+        item = tab.redo[-1]
+        if self._files_differ(item["files"], "old") and not force:
+            self.push_screen(ConfirmScreen("Some files changed since the undo.",
+                                           "Redo anyway? ocode's version would replace your changes."),
+                             lambda ok: self.redo_last(force=True) if ok else None)
+            return
+        try:
+            self._write_state(item["files"], "new")
+        except OSError as e:
+            self.notify(f"Couldn't redo: {e}", severity="error")
+            return
+        tab.redo.pop()
+        try:
+            item["info"].remove()
+        except Exception:
+            pass
+        turn = item["turn"]
+        turn["hist_start"] = len(tab.history)
+        turn["view_start"] = len(tab.view.children)
+        tab.history.extend(item["history"])
+        tab.turns.append(turn)
+        tab.undo.extend(item["files"])
+        self.render_history(tab, item["history"], note=None)
+        typed, paste = turn.get("restore") or ("", "")
+        if tab is self.cur_tab:
+            prompt = self.query_one("#prompt", Input)
+            if prompt.value.strip() == typed.strip():
+                prompt.value = ""
+            if paste and tab.pending_text == paste:
+                tab.pending_text = ""
+                self.refresh_attach()
+        save_session_file(tab)
+        self.notify("Redone." + (f" {len({r['path'] for r in item['files']})} file change(s) re-applied."
+                                 if item["files"] else ""), title="Redo", timeout=3)
+
+    def run_shell(self, tab, cmd):
+        """!command: run it yourself in this tab's folder. The output is added to the chat for the AI to see."""
+        if tab.busy:
+            self.notify("Wait for this tab to finish first (or press esc).", severity="warning")
+            return False
+        tab.turn_seq += 1
+        tab.turns.append({"id": tab.turn_seq, "hist_start": len(tab.history), "view_start": len(tab.view.children),
+                          "restore": ("!" + cmd, "")})
+        tab.cur_turn = tab.turn_seq
+        tab.redo.clear()
+        if not tab.title:
+            tab.title = ("$ " + cmd)[:30]
+        self.add_widget(Static(Text.assemble(("$ ", f"bold {CYAN}"), (cmd, FG)), classes="user"), tab)
+        tab.busy, tab.activity = True, f"running {cmd[:40]}…"
+        tab.stop.clear()
+        self.refresh_chrome()
+
+        def work():
+            kw = {"creationflags": 0x08000000} if IS_WIN else {}
+            try:
+                proc = subprocess.Popen(cmd, shell=True, cwd=tab.cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, text=True, errors="replace", **kw)
+            except Exception as e:
+                self.ui(self._shell_done, tab, cmd, None, str(e))
+                return
+            started, out = time.monotonic(), ""
+            while True:
+                try:
+                    out, _ = proc.communicate(timeout=0.3)
+                    break
+                except subprocess.TimeoutExpired:
+                    if tab.stop.is_set() or time.monotonic() - started > 600:
+                        proc.kill()
+                        out = (proc.communicate()[0] or "") + "\n(stopped)"
+                        break
+            self.ui(self._shell_done, tab, cmd, proc.returncode, out)
+
+        self.run_worker(work, thread=True, exit_on_error=False)
+        return True
+
+    def _shell_done(self, tab, cmd, code, out):
+        out = (out or "").rstrip()
+        short_out = out if len(out) <= 8000 else out[:4000] + "\n…\n" + out[-4000:]
+        status = "ok" if code == 0 else "error"
+        first = f"exit {code}" if code is not None else "couldn't start"
+        lines = out.splitlines()
+        self.ui_tool(tab, "$ " + cmd, (first + ("\n" + "\n".join(lines[-3:]) if lines else "")).strip(), status, out)
+        tab.history.append({"role": "user", "content": f"[I ran this shell command myself in {tab.cwd}]\n$ {cmd}\n"
+                                                         f"exit code {code}\n```\n{short_out}\n```"})
+        tab.busy, tab.activity = False, ""
+        tab.cur_turn = None
+        self.refresh_chrome()
+        self.session_save()
+        save_session_file(tab)
+
+    def btw_worker(self, screen, question, tab):
+        cfg = self.cfg
+        if not cfg["model"]:
+            self.ui(screen.set_answer, "Pick a model first (/models).", True)
+            return
+        system = PROMPT_CHAT + ("\n\nThis is a quick side question from the user. Answer briefly and directly. "
+                                "It won't be added to the main conversation.")
+        messages = [{"role": "system", "content": system}] + self.outgoing(tab.history[-30:]) + \
+                   [{"role": "user", "content": question}]
+        payload = {"model": cfg["model"], "messages": messages, "stream": True,
+                   "options": {"temperature": cfg["temperature"], "num_ctx": int(cfg["num_ctx"])}}
+        acc, last = [], 0.0
+        try:
+            with http(cfg, "/api/chat", payload, timeout=600) as r:
+                for raw in r:
+                    if screen.closed:
+                        return
+                    if not raw.strip():
+                        continue
+                    chunk = json.loads(raw.decode("utf-8"))
+                    if "error" in chunk:
+                        raise OllamaError(chunk["error"])
+                    piece = chunk.get("message", {}).get("content", "")
+                    if piece:
+                        acc.append(piece)
+                        if time.monotonic() - last > 0.08:
+                            last = time.monotonic()
+                            self.ui(screen.set_answer, visible_text("".join(acc), False))
+                    if chunk.get("done"):
+                        break
+        except Exception as e:
+            self.ui(screen.set_answer, f"Couldn't get an answer: {e}", True)
+            return
+        self.ui(screen.set_answer, visible_text("".join(acc), False) or "(no answer)", True)
+
+    def ask_btw(self, question):
+        if not question.strip():
+            self.notify("Usage: /btw <your question>  - answered in a popup, not added to the chat.", severity="warning")
+            return
+        self.push_screen(BtwScreen(question.strip(), self.cur_tab))
+
+    def open_sessions(self):
+        open_ids = {t.session_id for t in self.tabs if t.history}
+
+        def chosen(sid):
+            if sid:
+                self.open_session(sid)
+            self.query_one("#prompt", Input).focus()
+        self.push_screen(SessionsScreen(open_ids), chosen)
+
+    def open_session(self, sid, note="reopened from /sessions"):
+        for t in self.tabs:
+            if t.session_id == sid and not t.closed:
+                self.switch_tab(t)
+                return t
+        d = load_session(sid)
+        if not d:
+            self.notify("That chat couldn't be found any more.", severity="warning")
+            return None
+        cur = self.cur_tab
+        tab = cur if (not cur.started and not cur.history and not cur.busy) else self.new_tab(switch=False)
+        tab.session_id, tab.created = sid, d.get("created") or time.time()
+        tab.title = (d.get("title") or "")[:40]
+        if d.get("cwd") and Path(d["cwd"]).is_dir():
+            tab.cwd = d["cwd"]
+        if d.get("agent") in AGENTS:
+            tab.agent = d["agent"]
+        tab.summary = d.get("summary") or ""
+        tab.history = [{"role": m["role"], "content": m.get("content", "")}
+                       for m in d.get("history", []) if m.get("role") in ("user", "assistant")]
+        self.render_history(tab, note=note)
+        if tab is not self.cur_tab:
+            self.switch_tab(tab)
+        else:
+            self.show_active_view()
+            self.refresh_chrome()
+        return tab
+
+    def action_reopen_tab(self):
+        while self.closed_sessions:
+            sid = self.closed_sessions.pop()
+            if not any(t.session_id == sid for t in self.tabs):
+                self.open_session(sid, note="reopened")
+                return
+        self.notify("No closed tabs to reopen. /sessions has all your past chats.", timeout=4)
+
+    def add_pasted_text(self, text):
+        tab = self.cur_tab
+        text = text.replace("\r\n", "\n").strip("\n")
+        tab.pending_text = (tab.pending_text + "\n\n" + text) if tab.pending_text else text
+        self.refresh_attach()
+
+    def open_file_picker(self, query, start, end):
+        tab = self.cur_tab
+
+        def chosen(rel):
+            prompt = self.query_one("#prompt", Input)
+            if rel:
+                ins = ('"' + rel + '"') if " " in rel else rel
+                value = prompt.value
+                if start <= len(value) and value[start:start] != "@":
+                    new_before = value[:start] + ins
+                    prompt.value = new_before + value[end:]
+                    prompt.cursor_position = len(new_before)
+            prompt.focus()
+        self.push_screen(FilePickerScreen(tab.cwd, query), chosen)
+
+    def open_editor(self):
+        tab = self.cur_tab
+        prompt = self.query_one("#prompt", Input)
+        start_text = tab.pending_text or prompt.value
+        editor = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+        if not editor:
+            editor = "notepad" if IS_WIN else next((e for e in ("nano", "vim", "vi") if shutil.which(e)), "")
+        if not editor:
+            self.notify("No editor found. Set the EDITOR environment variable (e.g. EDITOR=nano).", severity="warning")
+            return
+        f = Path(tempfile.gettempdir()) / f"ocode-message-{os.getpid()}.md"
+        f.write_text(start_text, encoding="utf-8")
+        cmd = shlex.split(editor, posix=not IS_WIN) + [str(f)]
+        try:
+            try:
+                with self.suspend():
+                    subprocess.run(cmd)
+            except Exception:  # can't hand the terminal over here - fine for window editors like Notepad
+                subprocess.run(cmd)
+            text = f.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n").strip()
+        except Exception as e:
+            self.notify(f"Couldn't open {editor}: {e}", severity="error")
+            return
+        finally:
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        if "\n" in text:
+            tab.pending_text = text
+            prompt.value = ""
+        else:
+            tab.pending_text = ""
+            prompt.value = text
+            prompt.cursor_position = len(text)
+        self.refresh_attach()
+        prompt.focus()
+
+    def note_recent_model(self, model, save=True):
+        if not model:
+            return
+        recent = [m for m in (self.cfg.get("recent_models") or []) if m != model]
+        self.cfg["recent_models"] = [model] + recent[:7]
+        if save:
+            save_settings(self.cfg)
+
+    def action_recent_model(self):
+        current = self.cfg.get("model")
+        others = [m for m in (self.cfg.get("recent_models") or []) if m != current]
+        if not others:
+            self.notify("Pick a second model with /models first - then F2 switches between them.", timeout=4)
+            return
+        self.cfg["model"] = others[0]
+        self.note_recent_model(others[0])
+        self.refresh_chrome()
+        self.notify(f"Model: {others[0]}", timeout=2)
+
+    def compact_now(self):
+        tab = self.cur_tab
+        if tab.busy:
+            self.notify("Wait until this tab has finished, then compact.", severity="warning")
+            return
+        if len(tab.history) < 4:
+            self.notify("This chat is still short - nothing to compact.", timeout=3)
+            return
+        if not self.cfg["model"]:
+            self.notify("Pick a model first (/models).", severity="warning")
+            return
+        tab.busy, tab.activity = True, "summarizing the conversation…"
+        self.refresh_chrome()
+
+        def work():
+            msgs = tab.history
+            keep = 2 if len(msgs) > 2 else 0
+            folded = msgs[:len(msgs) - keep]
+            try:
+                summary = summarize(self.cfg, tab.summary, folded)
+            except Exception as e:
+                self.ui(self._compact_done, tab, None, 0, str(e))
+                return
+            self.ui(self._compact_done, tab, summary, len(folded), "")
+
+        self.run_worker(work, thread=True, exit_on_error=False)
+
+    def _compact_done(self, tab, summary, n, err):
+        tab.busy, tab.activity = False, ""
+        if summary:
+            tab.summary = summary
+            del tab.history[:n]
+            tab.turns, tab.redo = [], []
+            tab.undo = []
+            self.add_widget(Static(Text.assemble(("⇣ compacted  ", f"bold {ACCENT}"),
+                                                 (f"{n} messages folded into a summary the AI keeps · undo history "
+                                                  "starts fresh from here", MUTED)), classes="info"), tab)
+            save_session_file(tab)
+        else:
+            self.notify(f"Couldn't summarize: {err or 'the model returned nothing'}", severity="error")
+        self.refresh_chrome()
+
+    def open_highlights(self):
+        self.push_screen(HighlightsScreen())
+
     # ----- updates -----
     def auto_update_check(self):
         """Once a day, quietly look for a new version on GitHub."""
@@ -5413,45 +6310,6 @@ class OcodeApp(App):
         self.set_timer(1.2, self.action_quit_app)
 
     # ----- coding helpers: undo, git, prompt commands -----
-    def undo_last(self, force=False):
-        tab = self.cur_tab
-        if tab.busy:
-            self.notify("Wait until this tab has finished (or press esc), then undo.", severity="warning")
-            return
-        if not tab.undo:
-            self.notify("Nothing to undo in this tab. (/undo reverts file changes ocode made; "
-                        "commands it ran can't be undone.)", title="Undo", timeout=6)
-            return
-        rec = tab.undo[-1]
-        p = Path(rec["path"])
-        now = p.read_bytes() if p.is_file() else None
-        if now != rec["new"] and not force:
-            self.push_screen(ConfirmScreen(f"{short_path(p)} changed after ocode edited it.",
-                                           "Undo anyway? Changes made since then would be lost."),
-                             lambda ok: self.undo_last(force=True) if ok else None)
-            return
-        tab.undo.pop()
-        try:
-            if rec["old"] is None:
-                if p.exists():
-                    p.unlink()
-                what = "deleted the file ocode created"
-            else:
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_bytes(rec["old"])
-                what = "restored the previous version"
-        except OSError as e:
-            self.notify(f"Couldn't undo: {e}", severity="error")
-            return
-        try:
-            rel = p.relative_to(Path(tab.cwd).resolve()).as_posix()
-        except ValueError:
-            rel = short_path(p)
-        tab.history.append({"role": "user", "content": f"[Note: the user undid your change to {rel} ({what}).]"})
-        self.add_widget(ToolCard(f"undo {rel}", what + (f" · {len(tab.undo)} more change(s) can be undone"
-                                                         if tab.undo else ""), "", "ok"), tab)
-        self.notify(f"Undid the change to {rel}.", title="Undo", timeout=3)
-
     def show_diff(self):
         tab = self.cur_tab
 
@@ -5580,7 +6438,7 @@ class OcodeApp(App):
             return  # nothing new - keep whatever was saved before
         data = {"version": 1, "saved": time.time(),
                 "current": tabs.index(self.cur_tab) if self.cur_tab in tabs else 0,
-                "tabs": [{"title": t.title, "cwd": t.cwd, "agent": t.agent, "summary": t.summary,
+                "tabs": [{"id": t.session_id, "title": t.title, "cwd": t.cwd, "agent": t.agent, "summary": t.summary,
                           "history": history_for_save(t.history)} for t in tabs]}
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -5590,15 +6448,19 @@ class OcodeApp(App):
         except Exception:
             pass
 
-    def render_history(self, tab):
-        for m in tab.history:
+    def render_history(self, tab, msgs=None, note="restored from your last session"):
+        msgs = tab.history if msgs is None else msgs
+        for m in msgs:
             c = m.get("content", "")
             if m["role"] == "user":
                 if c.startswith("<tool_result"):
                     names = re.findall(r'<tool_result name="(\w+)"', c)
                     self.add_widget(Static(Text("▸ used " + (", ".join(names) or "tools"), style=MUTED),
                                            classes="tool"), tab)
-                else:
+                elif c.startswith("[I ran this shell command"):
+                    first = next((l for l in c.splitlines() if l.startswith("$ ")), "$ (command)")
+                    self.add_widget(Static(Text("▸ " + first, style=MUTED), classes="tool"), tab)
+                elif not c.startswith("[Note:"):
                     self.add_widget(Static(Text(c if len(c) <= 1500 else c[:1500] + " …"), classes="user"), tab)
             else:
                 v = visible_text(c, True)
@@ -5606,8 +6468,8 @@ class OcodeApp(App):
                     w = Static(md(v), classes="assistant")
                     w.raw = v
                     self.add_widget(w, tab)
-        if tab.history:
-            self.add_widget(Static(Text("restored from your last session", style=MUTED), classes="info"), tab)
+        if msgs and note:
+            self.add_widget(Static(Text(note, style=MUTED), classes="info"), tab)
 
     def session_restore(self):
         try:
@@ -5630,6 +6492,8 @@ class OcodeApp(App):
             if t.get("agent") in AGENTS:
                 tab.agent = t["agent"]
             tab.summary = t.get("summary", "")
+            if t.get("id"):
+                tab.session_id = t["id"]
             tab.history = [{"role": m["role"], "content": m.get("content", "")}
                            for m in t["history"] if m.get("role") in ("user", "assistant")]
             self.render_history(tab)
@@ -5849,6 +6713,10 @@ class OcodeApp(App):
         self.query_one("#prompt", Input).focus()
 
     def remove_attachment(self, i):
+        if i == "paste":
+            self.cur_tab.pending_text = ""
+            self.refresh_attach()
+            return
         imgs = self.cur_tab.pending_images
         if 0 <= i < len(imgs):
             imgs.pop(i)
@@ -5860,12 +6728,20 @@ class OcodeApp(App):
         except Exception:
             return
         imgs = self.cur_tab.pending_images
-        bar.display = bool(imgs)
-        if not imgs:
+        paste = self.cur_tab.pending_text
+        bar.display = bool(imgs or paste)
+        if not imgs and not paste:
             bar.spans = []
             return
         t = Text(no_wrap=True, overflow="ellipsis")
         spans, x = [], 0
+        if paste:
+            n = paste.count("\n") + 1
+            label = f" ▤ pasted {n} line{'s' if n != 1 else ''} · {len(paste):,} chars  × "
+            t.append(label, style=f"{FG} on {PANEL2}")
+            spans.append((x, x + cell_len(label), "paste"))
+            x += cell_len(label) + 2
+            t.append("  ")
         for i, im in enumerate(imgs):
             if im.get("kind") == "video":
                 label = f" ▶ {im['name'][:20]}  {fmt_dur(im['duration'])} · {len(im['frames'])} frames  × "
@@ -5875,7 +6751,8 @@ class OcodeApp(App):
             spans.append((x, x + cell_len(label), i))
             x += cell_len(label) + 2
             t.append("  ")
-        t.append("enter to send" + (" with the image" if len(imgs) == 1 else f" with {len(imgs)} images"), style=MUTED)
+        t.append("enter to send" + ("" if not imgs else " with the image" if len(imgs) == 1 else f" with {len(imgs)} images"),
+                 style=MUTED)
         bar.update(t)
         bar.spans = spans
 
@@ -6117,6 +6994,20 @@ class OcodeApp(App):
             self.copy_last_reply()
         elif cmd == "/undo":
             self.undo_last()
+        elif cmd == "/redo":
+            self.redo_last()
+        elif cmd == "/btw":
+            self.ask_btw(arg)
+        elif cmd in ("/sessions", "/history"):
+            self.open_sessions()
+        elif cmd == "/reopen":
+            self.action_reopen_tab()
+        elif cmd == "/editor":
+            self.open_editor()
+        elif cmd in ("/compact", "/summarize"):
+            self.compact_now()
+        elif cmd in ("/highlights", "/whatsnew"):
+            self.open_highlights()
         elif cmd == "/diff":
             self.show_diff()
         elif cmd == "/commit":
@@ -6263,7 +7154,16 @@ class OcodeApp(App):
             ("export", "Chat & tabs", "Export chat to Markdown", "", ""),
             ("copy", "Chat & tabs", "Copy last reply", "", ""),
             # Code & git
-            ("undo", "Code & git", "Undo last file change", "", f"{len(tab.undo)} available"),
+            ("undo", "Chat & tabs", "Undo last message", "", f"{len(tab.turns)} available"),
+            ("redo", "Chat & tabs", "Redo", "", f"{len(tab.redo)} available"),
+            ("sessions", "Chat & tabs", "Sessions…", "", f"{len(list_sessions())} saved"),
+            ("reopen", "Chat & tabs", "Reopen closed tab", "ctrl+shift+t", ""),
+            ("compact", "Chat & tabs", "Compact conversation", "", ""),
+            ("btw", "Chat & tabs", "Ask a side question (/btw)", "", ""),
+            ("editor", "Chat & tabs", "Write in your editor", "", os.environ.get("EDITOR") or ("notepad" if IS_WIN else "")),
+            ("recentmodel", "Model & look", "Switch to last model", "F2",
+             next((m for m in (c.get("recent_models") or []) if m != c.get("model")), "")),
+            ("highlights", "App", "What's new", "", f"v{VERSION}"),
             ("diff", "Code & git", "Show git changes", "", ""),
             ("commit", "Code & git", "Commit changes", "", "AI writes the message"),
             ("cd", "Code & git", "Change working folder…", "", short_path(self.cwd)),
@@ -6300,6 +7200,24 @@ class OcodeApp(App):
                 self.open_help()
             elif cid == "update":
                 self.update_ocode()
+            elif cid == "redo":
+                self.redo_last()
+            elif cid == "sessions":
+                self.open_sessions()
+            elif cid == "reopen":
+                self.action_reopen_tab()
+            elif cid == "compact":
+                self.compact_now()
+            elif cid == "btw":
+                prompt = self.query_one("#prompt", Input)
+                prompt.value = "/btw "
+                prompt.cursor_position = len(prompt.value)
+            elif cid == "editor":
+                self.open_editor()
+            elif cid == "recentmodel":
+                self.action_recent_model()
+            elif cid == "highlights":
+                self.open_highlights()
             elif cid == "resume":
                 self.session_restore()
             elif cid == "undo":
@@ -6384,6 +7302,7 @@ class OcodeApp(App):
         def chosen(res):
             if res:
                 self.cfg["model"] = res
+                self.note_recent_model(res)
                 save_settings(self.cfg)
                 self.refresh_chrome()
                 self.notify(f"Model: {res}")
@@ -6429,7 +7348,7 @@ class OcodeApp(App):
         except Exception:
             modal = False
         if action in ("palette", "cycle_agent", "voice", "screen", "new_tab", "close_tab",
-                      "next_tab", "prev_tab", "monitor", "attach", "help") and modal:
+                      "next_tab", "prev_tab", "monitor", "attach", "help", "reopen_tab", "recent_model") and modal:
             return False
         if action == "close_tab":  # when you are typing, ctrl+w keeps its normal "delete word" job
             try:
@@ -6437,7 +7356,8 @@ class OcodeApp(App):
             except Exception:
                 return True
         if action == "interrupt":
-            active = self.busy or self.listening or self.transcribing or self.speaker.speaking
+            active = (self.busy or self.listening or self.transcribing or self.speaker.speaking
+                      or bool(self.cur_tab.queue))
             return active and not modal
         return True
 
@@ -6447,6 +7367,14 @@ class OcodeApp(App):
             self.mic_cancel = True
             self.mic_stop.set()
         self.speaker.stop()
+        if self.cur_tab.queue:
+            for item in self.cur_tab.queue:
+                try:
+                    item["widget"].remove()
+                except Exception:
+                    pass
+            self.notify(f"Cleared {len(self.cur_tab.queue)} queued message(s).", timeout=3)
+            self.cur_tab.queue.clear()
         if self.busy:
             self.stop.set()
             self.set_activity(self.cur_tab, "stopping…")

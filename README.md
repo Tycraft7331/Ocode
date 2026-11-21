@@ -65,6 +65,21 @@ or `ctrl+p` for the command palette. Highlights:
 `ctrl+g` shows it your screen, `ctrl+o` attaches an image or video, `ctrl+b` opens the system monitor,
 `/theme`, `/google`, `/discord`, `/memory`, `/resume` (bring back your last chats), `/export` (save a chat as Markdown), `/copy` (copy the last reply).
 
+## Everyday extras
+
+```
+/undo   /redo              take back your last message - the reply and every file change - and bring it back
+!git status                start a message with ! to run a shell command; the output stays in the chat
+/btw <question>            a quick side question in a popup, not added to the chat
+/sessions                  browse and reopen every chat you've had · ctrl+shift+t (or /reopen) reopens a closed tab
+/editor                    write a long message in your text editor (EDITOR, or Notepad on Windows)
+/compact                   summarize a long chat to free up the model's memory
+F2                         switch back to the model you used before
+```
+
+Press enter while the AI is working and your message is queued. Multi-line pastes are kept whole.
+`/highlights` shows what's new after an update.
+
 ## Themes
 
 18 themes, each with matching code colours: **Catppuccin Mocha, Dracula, Everforest, GitHub Dark, Gruvbox, Matrix,
@@ -77,7 +92,8 @@ Type `/theme` for a picker with a live preview (in it: `l` logo style, `a` anima
 ## Coding helpers
 
 ```
-@src/app.py                put a file (or folder) into your message - press tab to complete the name
+@src/app.py                put a file (or folder) into your message - press tab to complete or search
+@src/app.py#20-45          only lines 20-45 of a file
 up / down                  bring back messages you sent before
 /undo                      undo the last file change ocode made (again to go further back)
 /diff                      see what changed in your git repo
