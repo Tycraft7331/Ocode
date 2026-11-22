@@ -69,6 +69,10 @@ import importlib.util
 import io
 import secrets
 import webbrowser
+import ast
+import calendar
+import contextlib
+import math
 import getpass
 import json
 import os
@@ -113,13 +117,14 @@ except ImportError:
     print("ocode needs the 'textual' package. Install it with:\n\n    python -m pip install textual\n")
     sys.exit(1)
 
-VERSION = "4.7.0"
+VERSION = "4.8.0"
 CONFIG_DIR = Path(os.environ.get("OCODE_HOME") or (Path.home() / ".ocode"))  # set OCODE_HOME to keep settings elsewhere
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 MEMORY_FILE = CONFIG_DIR / "memory.json"
 GOOGLE_CREDS = CONFIG_DIR / "google_credentials.json"
 GOOGLE_TOKEN = CONFIG_DIR / "google_token.json"
 SESSION_FILE = CONFIG_DIR / "session.json"
+TODO_FILE = CONFIG_DIR / "todo.json"
 MCP_FILE = CONFIG_DIR / "mcp.json"
 TELEGRAM_FILE = CONFIG_DIR / "telegram.json"
 SESSIONS_DIR = CONFIG_DIR / "sessions"
@@ -259,6 +264,8 @@ DEFAULTS = {
     "recent_models": [],         # newest first, for F2
     "seen_version": "",          # to show "what's new" once after an update
     "show_highlights": True,
+    "instructions": "",          # your standing instructions, added to every chat (/instructions)
+    "weather_place": "",         # last place /weather looked up
     "welcome": True,             # the big welcome message on the home screen
     "user_name": "",             # what ocode calls you ("" = your computer user name)
     "telegram_autostart": False,
@@ -2330,12 +2337,34 @@ BUILTIN_PROMPTS = {
     "fix": ("Find and fix a problem", "build", None,
             "Find and fix this problem: $ARGUMENTS\nReproduce it first if you can, find the real cause, make the "
             "smallest correct fix, then check that it works."),
+    "translate": ("Translate text into another language", "", None,
+                  "Translate the following. If I named a language first (like \"spanish: hello\" or \"to French ...\"), "
+                  "translate into that language; otherwise translate into English. Keep the meaning and tone, and "
+                  "give only the translation, then one short note if a phrase has no direct equivalent.\n\n$ARGUMENTS"),
+    "eli5": ("Explain something simply", "", None,
+             "Explain this like I'm new to it: $ARGUMENTS\nUse plain words, one everyday comparison, and a tiny "
+             "example if it helps. Keep it short."),
+    "refactor": ("Clean up code without changing what it does", "build", "the file I changed most recently",
+                 "Refactor $ARGUMENTS. Make it easier to read and maintain - better names, smaller functions, less "
+                 "repetition - without changing behaviour. Read it first, explain the plan in a few bullets, make "
+                 "the changes, then run any tests."),
+    "document": ("Add comments, docstrings and a README section", "build", "the main code in this project",
+                 "Document $ARGUMENTS: add clear docstrings/comments where the code isn't obvious (don't comment "
+                 "every line) and update or create a README section explaining how to use it."),
+    "security": ("Look for security problems", "plan", "this project",
+                 "Do a security review of $ARGUMENTS. Look for secrets in code, injection (SQL, shell, path), unsafe "
+                 "deserialisation, missing input validation, weak auth, and risky dependencies. List each finding "
+                 "with file, line, why it matters and how to fix it - most serious first. Don't change files."),
+    "optimize": ("Make code faster or lighter", "build", "the slowest part of this project",
+                 "Find what makes $ARGUMENTS slow or memory-hungry and improve it. Measure or reason about the hot "
+                 "spots first, explain the trade-offs, then make the changes and check nothing broke."),
     "init": ("Write an OCODE.md describing this project", "build", "",
              "Explore this project and create an OCODE.md file at its root describing: what the project is, how to "
              "install / build / run / test it, the main folders and what lives in them, and coding conventions you "
              "notice. Keep it under 60 lines - it is read at the start of every ocode session here. $ARGUMENTS"),
 }
-PROMPT_USAGE = {"fix": "/fix <describe the problem>"}
+PROMPT_USAGE = {"fix": "/fix <describe the problem>", "translate": "/translate [language:] <text>",
+                "eli5": "/eli5 <topic>"}
 
 
 def load_prompt_commands(cwd):
@@ -2843,11 +2872,22 @@ PALETTE_KEYWORDS = {  # extra words each command can be found by
     "screen": "screenshot look see", "listen": "mic microphone talk voice speech", "speak": "voice tts audio",
     "voice": "mic microphone speech", "memory": "remember facts", "remember": "memory fact",
     "update": "upgrade new version github latest", "model": "ollama llm", "theme": "colour color dark light", "randomtheme": "colour color surprise",
-    "logo": "gradient banner", "welcome": "greeting hello banner home", "editmemory": "change fix update memories remember", "tidymemory": "clean duplicates forget old prune memories", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
+    "logo": "gradient banner", "welcome": "greeting hello banner home", "editmemory": "change fix update memories remember", "tidymemory": "clean duplicates forget old prune memories",
+    "time": "date clock calendar day month year", "calc": "calculator math maths sum", "timer": "alarm countdown reminder",
+    "todo": "tasks checklist list", "weather": "forecast temperature rain", "search": "find grep past chats history",
+    "doctor": "health diagnose check setup problems", "pull": "download install ollama models", "retry": "regenerate again redo",
+    "instructions": "custom rules system prompt always", "name": "call me username who am i", "animations": "shimmer motion cursor", "settings": "options preferences config host",
 }
 
 
 WHATS_NEW = {
+    "4.8.0": [
+        ("Handy tools", "/time, /calc, /timer, /todo, /weather, /roll and /flip - quick helpers that don't need the AI."),
+        ("/search", "Find any past chat that mentions something."),
+        ("/retry · /instructions", "Get a fresh reply, or give ocode rules to follow in every chat."),
+        ("/pull · /doctor", "Download Ollama models with a progress bar, and check your setup."),
+        ("More prompts", "/translate, /eli5, /refactor, /document, /security and /optimize."),
+    ],
     "4.7.0": [
         ("Tidy memory", "Duplicate memories now merge themselves, and things ocode learned that haven't come up in 60 "
                         "days fade away. Memories you wrote or edited stay. In /memory: k keeps one forever, "
@@ -2985,7 +3025,13 @@ def option_row(left, right="", marker=False, left_style=None):
 
 def fmt_secs(sec):
     sec = max(0, int(sec))
-    return f"{sec}s" if sec < 60 else f"{sec // 60}m {sec % 60:02d}s"
+    if sec < 60:
+        return f"{sec}s"
+    if sec < 3600:
+        return f"{sec // 60}m {sec % 60:02d}s"
+    if sec < 86400:
+        return f"{sec // 3600}h {sec % 3600 // 60:02d}m"
+    return f"{sec // 86400}d {sec % 86400 // 3600}h"
 
 
 class PaletteScreen(ModalScreen):
@@ -3641,6 +3687,15 @@ HELP_TOPICS = [
       ("/sessions", "browse, search and reopen every chat you've had"),
       ("/reopen  or  ctrl+shift+t", "bring back the tab you just closed"),
       ("/undo", "take back your last message, its reply and its file changes - your text comes back to edit"),
+      ("/retry", "ask again: throw away the last reply and get a new one  (/regen)"),
+      ("/instructions [text]", "standing instructions ocode follows in every chat  (/instructions clear)"),
+      ("/temp [0-2]", "how creative replies are - 0 is focused, 1 is creative"),
+      ("/translate [language:] <text>", "translate text (into English unless you name a language)"),
+      ("/eli5 <topic>", "explain something simply"),
+      ("/refactor [what]", "clean up code without changing what it does"),
+      ("/document [what]", "add docstrings, comments and a README section"),
+      ("/security [what]", "look for security problems (doesn't change files)"),
+      ("/optimize [what]", "make code faster or lighter"),
       ("/redo", "bring back what /undo took"),
       ("/compact", "summarize a long chat now to free up the model's memory"),
       ("click", "click a tab to switch, x to close it, + for a new one")]),
@@ -3696,6 +3751,19 @@ HELP_TOPICS = [
      [("/google", "connect your account and choose what ocode may use"),
       ("ask in plain English", "\"any emails from Sam this week?\"  \"what's on my calendar tomorrow?\""),
       ("adding events", "creating a calendar event always asks you first")]),
+    ("tools", "Handy tools",
+     "Quick helpers that don't need the AI.",
+     [("/time", "the time, date and this month's calendar  (/date, /calendar)"),
+      ("/calc 15% of 80", "a calculator: + - * / ^ %, sqrt(), sin(), pi …"),
+      ("/timer 10m tea", "a timer that pings you (and your phone, with /notify) - /timer list, /timer cancel"),
+      ("/todo [thing]", "a to-do list saved between sessions - /todo list, /todo done 2"),
+      ("in /todo", "a add · space done · e edit · d delete · x ask ocode for help with it · c clear finished"),
+      ("/weather [place]", "current weather and the next few days (remembers your place)"),
+      ("/search <words>", "find any past chat that mentions something"),
+      ("/roll 2d6", "roll dice (d20, 3d6+2 …)"),
+      ("/flip", "flip a coin"),
+      ("/doctor", "check that Ollama, models, voice and the rest are set up right"),
+      ("/pull <model>", "download a new Ollama model with a progress bar")]),
     ("connections", "Connections",
      "Link ocode to other tools and apps. /connections shows everything in one place.",
      [("/connections", "everything ocode can link to, with what's connected"),
@@ -4390,6 +4458,108 @@ class NotifyScreen(ModalScreen):
     def action_close(self):
         self._save_inputs()
         save_settings(self.app.cfg)
+        self.dismiss(None)
+
+
+class TodoScreen(ModalScreen):
+    """/todo: a simple to-do list that's saved between sessions."""
+    BINDINGS = [Binding("escape", "close", "Close"), Binding("a", "add", show=False), Binding("space", "toggle", show=False),
+                Binding("d", "delete", show=False), Binding("c", "clear_done", show=False),
+                Binding("e", "edit", show=False), Binding("x", "send", show=False)]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="picker"):
+            yield Static(dialog_title("To-do", "saved between sessions"), classes="title")
+            yield OptionList(id="todo-list")
+            yield Static(keys_hint(("a", "add"), ("space", "done"), ("d", "delete"), ("x", "ask ocode"),
+                                   ("esc", "close")), classes="hint")
+
+    def on_mount(self):
+        self.refill()
+        self.query_one(OptionList).focus()
+
+    def refill(self, index=None):
+        items = load_todos()
+        ol = self.query_one(OptionList)
+        keep = ol.highlighted if index is None else index
+        ol.clear_options()
+        for n, it in enumerate(items, 1):
+            done = it.get("done")
+            t = Text()
+            t.append("  ✓ " if done else "  ○ ", style=GREEN if done else ACCENT)
+            t.append(it["text"], style=f"strike {MUTED}" if done else FG)
+            ol.add_option(Option(option_row(t, Text(time.strftime("%b %d", time.localtime(it.get("added", 0))),
+                                                    style=MUTED)), id=str(n - 1)))
+        if not items:
+            ol.add_option(Option(Text("Nothing to do! Press a to add something.", style=MUTED), disabled=True))
+        elif keep is not None:
+            ol.highlighted = max(0, min(keep, len(items) - 1))
+
+    def _cur(self):
+        ol = self.query_one(OptionList)
+        if ol.highlighted is None or ol.get_option_at_index(ol.highlighted).disabled:
+            return None, None
+        items = load_todos()
+        i = int(ol.get_option_at_index(ol.highlighted).id)
+        return (items, i) if i < len(items) else (None, None)
+
+    @on(OptionList.OptionSelected, "#todo-list")
+    def _sel(self, e):
+        self.action_toggle()
+
+    def action_add(self):
+        def got(v):
+            if v and v.strip():
+                items = load_todos()
+                items.append({"text": v.strip()[:200], "done": False, "added": time.time()})
+                save_todos(items)
+                self.refill(len(items) - 1)
+        self.app.push_screen(InputScreen("Add a to-do", ""), got)
+
+    def action_toggle(self):
+        items, i = self._cur()
+        if items is None:
+            return
+        items[i]["done"] = not items[i].get("done")
+        save_todos(items)
+        self.refill(i)
+
+    def action_edit(self):
+        items, i = self._cur()
+        if items is None:
+            return
+
+        def got(v):
+            if v is not None and v.strip():
+                cur = load_todos()
+                if i < len(cur):
+                    cur[i]["text"] = v.strip()[:200]
+                    save_todos(cur)
+                    self.refill(i)
+        self.app.push_screen(InputScreen("Edit to-do", items[i]["text"], select=False), got)
+
+    def action_delete(self):
+        items, i = self._cur()
+        if items is None:
+            return
+        items.pop(i)
+        save_todos(items)
+        self.refill(i)
+
+    def action_clear_done(self):
+        items = load_todos()
+        left = [it for it in items if not it.get("done")]
+        save_todos(left)
+        self.app.notify(f"Cleared {plural(len(items) - len(left), 'finished item')}.", timeout=2)
+        self.refill(0)
+
+    def action_send(self):
+        items, i = self._cur()
+        if items is None:
+            return
+        self.dismiss(items[i]["text"])
+
+    def action_close(self):
         self.dismiss(None)
 
 
@@ -6229,7 +6399,7 @@ class OcodeApp(App):
     #dialog.btw { width: 96; max-width: 96%; height: auto; max-height: 85%; padding: 1 2; }
     #btw-q { margin-bottom: 1; padding: 0 1; }
     #btw-scroll { height: auto; max-height: 30; }
-    #mcp-list, #conn-list { height: 1fr; max-height: 100%; }
+    #mcp-list, #conn-list, #todo-list { height: 1fr; max-height: 100%; }
     #mcp-detail { height: auto; }
     #dialog.palette { width: 92; max-width: 96%; height: 80%; padding: 1 2; }
     #palette-head { height: 1; margin-bottom: 1; }
@@ -6248,6 +6418,7 @@ class OcodeApp(App):
     #sysmon-body { width: 100%; height: auto; }
     .error { width: 100%; height: auto; padding: 0 3; color: $oc-red; margin-top: 1; }
     .info { width: 100%; height: auto; padding: 0 3; color: $oc-muted; margin-top: 1; }
+    .card { width: 100%; height: auto; padding: 0 3; margin-top: 1; }
 
     ModalScreen { align: center middle; background: $oc-bg 75%; }
     VerticalScroll { scrollbar-size-vertical: 1; scrollbar-background: $oc-panel; scrollbar-color: $oc-hover;
@@ -6340,6 +6511,9 @@ class OcodeApp(App):
             self.tip = "Your last chats were saved - type /resume (or start with ocode -c) to bring them back"
         self.discord = DiscordBridge(self)
         self.telegram = TelegramBridge(self)
+        self.timers = []
+        self.pulling = None
+        self.last_calc = None
         self.monitor = SystemMonitor(self)
         self.discord_tabs = {}
         self._last_discord = "off"
@@ -6491,6 +6665,8 @@ class OcodeApp(App):
             t.append("  ·  Discord…", style=MUTED)
         if self.telegram.status == "online":
             t.append("  ·  Telegram", style=GREEN)
+        if self.timers:
+            t.append(f"  ·  ⏲ {len(self.timers)}", style=YELLOW)
         n_mcp, n_cfg = len(mcp_connected()), len(MCP_REGISTRY)
         if n_cfg:
             t.append("  ·  ", style=MUTED)
@@ -6565,9 +6741,6 @@ class OcodeApp(App):
             self.query_one("#subtitle", Static).update(self.welcome_render())
         except Exception:
             pass
-
-    def on_resize(self, event):
-        self.refresh_welcome()
 
     def animate_logo(self):
         """A soft band of light sweeps across the logo every few seconds on the home screen."""
@@ -6659,6 +6832,7 @@ class OcodeApp(App):
 
     def on_resize(self, event):
         self.refresh_tabbar()
+        self.refresh_welcome()
 
     def _tick(self):
         self.animate_logo()
@@ -7170,6 +7344,9 @@ class OcodeApp(App):
             notes = project_notes(tab.cwd)
             if notes:
                 parts.append("PROJECT INSTRUCTIONS " + notes)
+        if private_ok and (self.cfg.get("instructions") or "").strip():
+            parts.append("THE USER'S STANDING INSTRUCTIONS (always follow these unless they ask otherwise):\n"
+                         + self.cfg["instructions"].strip())
         if tab.summary:
             parts.append("SUMMARY OF THE EARLIER PART OF THIS CONVERSATION:\n" + tab.summary)
         return "\n\n".join(parts)
@@ -7798,6 +7975,361 @@ class OcodeApp(App):
 
     def open_highlights(self, since=""):
         self.push_screen(HighlightsScreen(since))
+
+    # ----- utility commands -----
+    def card(self, title, body, icon="◆", color=None):
+        """A small boxed panel in the chat for command results (/time, /calc, /weather …)."""
+        from rich.panel import Panel
+        from rich import box
+        head = Text.assemble((icon + " ", color or ACCENT), (title, f"bold {FG}"))
+        panel = Panel(body, title=head, title_align="left", box=box.ROUNDED, border_style=MUTED,
+                      padding=(0, 2), expand=False)
+        self.add_widget(Static(panel, classes="card"), self.cur_tab)
+
+    def cmd_time(self, arg=""):
+        now = datetime.datetime.now().astimezone()
+        hour = now.strftime("%I").lstrip("0") or "12"
+        head = Text.assemble((f"{hour}:{now.strftime('%M')}", f"bold {FG}"), (now.strftime(" %p"), FG2),
+                             (f"   {now.strftime('%A')}, {now.strftime('%B')} {now.day}, {now.year}", FG2), "\n",
+                             (f"{now.tzname() or ''}  ·  week {now.isocalendar()[1]}  ·  day {now.timetuple().tm_yday} "
+                              f"of {366 if calendar.isleap(now.year) else 365}", MUTED))
+        cal = Text("\n")
+        cal.append("Mo Tu We Th Fr Sa Su\n", style=f"bold {FG2}")
+        for week in calendar.Calendar().monthdayscalendar(now.year, now.month):
+            for i, d in enumerate(week):
+                if d == 0:
+                    cal.append("   ")
+                elif d == now.day:
+                    cal.append(f"{d:>2}", style=f"bold {BG} on {ACCENT}")
+                    cal.append(" ")
+                else:
+                    cal.append(f"{d:>2} ", style=YELLOW if i >= 5 else FG)
+            cal.append("\n")
+        self.card(now.strftime("%B %Y"), Group(head, cal), icon="◷")
+
+    def cmd_calc(self, arg):
+        if not arg:
+            self.notify("Usage: /calc 12*(3+4)   ·   /calc sqrt(2)^2   ·   /calc 15% of 80", title="Calculator")
+            return
+        try:
+            v = safe_calc(arg)
+        except CalcError as e:
+            self.notify(f"Couldn't work that out: {e}", title="Calculator", severity="warning")
+            return
+        self.last_calc = v
+        self.card("Calculator", Text.assemble((arg.strip(), FG2), ("  =  ", MUTED), (fmt_number(v), f"bold {GREEN}")),
+                  icon="∑")
+
+    def cmd_timer(self, arg):
+        a = arg.strip()
+        timers = self.timers
+        if not a or a in ("list", "ls"):
+            if not timers:
+                self.notify("No timers running. Start one with /timer 10m tea", title="Timers")
+                return
+            now = time.monotonic()
+            self.card("Timers", Text("\n".join(f"{n}. {t['label']}  -  {fmt_secs(max(0, t['end'] - now))} left"
+                                               for n, t in enumerate(timers, 1))), icon="⏲")
+            return
+        if a.split()[0] in ("cancel", "stop", "clear"):
+            rest = a.split()[1:]
+            if rest and rest[0].isdigit() and 1 <= int(rest[0]) <= len(timers):
+                gone = [timers[int(rest[0]) - 1]]
+            else:
+                gone = list(timers)
+            for t in gone:
+                t["handle"].stop()
+                timers.remove(t)
+            self.notify(f"Stopped {plural(len(gone), 'timer')}.", title="Timers", timeout=2)
+            self.refresh_chrome()
+            return
+        first, _, label = a.partition(" ")
+        secs = parse_duration(first)
+        if secs is None:  # "/timer tea 5m"
+            parts = a.split()
+            secs = parse_duration(parts[-1]) if parts else None
+            label = " ".join(parts[:-1])
+        if not secs or secs > 7 * 86400:
+            self.notify("Usage: /timer 5m tea   ·   /timer 1h30m   ·   /timer 90s   ·   /timer list   ·   /timer cancel",
+                        title="Timers", severity="warning")
+            return
+        label = label.strip() or f"{fmt_secs(secs)} timer"
+        t = {"label": label, "end": time.monotonic() + secs}
+        t["handle"] = self.set_timer(secs, lambda t=t: self.timer_done(t))
+        timers.append(t)
+        self.notify(f"{label} - I'll let you know in {fmt_secs(secs)}.", title="Timer started", timeout=3)
+        self.refresh_chrome()
+
+    def timer_done(self, t):
+        if t in self.timers:
+            self.timers.remove(t)
+        self.bell()
+        self.notify(f"⏰ {t['label']} is done!", title="Timer", severity="warning", timeout=30)
+        if self.cfg.get("ntfy_topic"):
+            cfg = dict(self.cfg)
+            threading.Thread(target=send_push, args=(cfg, "⏰ Timer done", t["label"]),
+                             kwargs={"priority": 4, "tags": ("alarm_clock",)}, daemon=True).start()
+        if self.cfg.get("speak"):
+            try:
+                self.speaker.speak(f"{t['label']} is done.", self.cfg["voice"], self.cfg["voice_rate"])
+            except Exception:
+                pass
+        self.refresh_chrome()
+
+    def cmd_roll(self, arg):
+        try:
+            total, rolls, mod = roll_dice(arg or "1d6")
+        except ValueError as e:
+            self.notify(str(e), title="Dice", severity="warning")
+            return
+        detail = " + ".join(map(str, rolls[:30])) + ("…" if len(rolls) > 30 else "")
+        if mod:
+            detail += f" {'+' if mod > 0 else '-'} {abs(mod)}"
+        self.card(f"Rolled {arg or '1d6'}", Text.assemble((str(total), f"bold {GREEN}"),
+                                                          (f"   ({detail})" if len(rolls) > 1 or mod else "", MUTED)),
+                  icon="⚄")
+
+    def cmd_flip(self):
+        side = secrets.choice(["Heads", "Tails"])
+        self.card("Coin flip", Text(side + "!", style=f"bold {GREEN if side == 'Heads' else YELLOW}"), icon="◎")
+
+    def cmd_weather(self, arg):
+        place = arg.strip() or self.cfg.get("weather_place") or ""
+        if not place:
+            self.notify("Which place?  /weather Austin, TX  - ocode remembers it for next time.", title="Weather")
+            return
+        self.notify(f"Checking the weather in {place}…", timeout=2)
+
+        def work():
+            try:
+                w = fetch_weather(place)
+            except Exception as e:
+                msg = str(e) if isinstance(e, ValueError) else "couldn't reach the weather service - are you online?"
+                self.ui(self.notify, f"Weather: {msg}", severity="warning")
+                return
+            self.ui(self.weather_card, w, place)
+        threading.Thread(target=work, daemon=True).start()
+
+    def weather_card(self, w, place):
+        self.cfg["weather_place"] = place
+        save_settings(self.cfg)
+        unit = "°F" if w["us"] else "°C"
+        speed = "mph" if w["us"] else "km/h"
+        cur, daily = w["current"], w["daily"]
+        desc, icon = WEATHER_CODES.get(cur.get("weather_code"), ("", "·"))
+        t = Text()
+        t.append(f"{icon}  {round(cur.get('temperature_2m', 0))}{unit}", style=f"bold {FG}")
+        t.append(f"  {desc}", style=FG2)
+        t.append(f"\nfeels like {round(cur.get('apparent_temperature', 0))}{unit}  ·  humidity "
+                 f"{cur.get('relative_humidity_2m', '?')}%  ·  wind {round(cur.get('wind_speed_10m', 0))} {speed}\n",
+                 style=MUTED)
+        for i, day in enumerate((daily.get("time") or [])[:4]):
+            try:
+                d = datetime.date.fromisoformat(day)
+                name = "Today" if i == 0 else d.strftime("%a")
+                dd, di = WEATHER_CODES.get(daily["weather_code"][i], ("", "·"))
+                rain = (daily.get("precipitation_probability_max") or [None] * 4)[i]
+                t.append(f"\n{name:<6}", style=f"bold {FG2}")
+                t.append(f"{di} {round(daily['temperature_2m_max'][i]):>3}° / {round(daily['temperature_2m_min'][i]):>3}°",
+                         style=FG)
+                t.append(f"  {dd}" + (f", {rain}% rain" if rain else ""), style=MUTED)
+            except Exception:
+                continue
+        self.card(f"Weather · {w['place']}", t, icon="☁")
+
+    def cmd_doctor(self):
+        self.notify("Running a health check…", timeout=2)
+
+        def work():
+            buf = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(buf):
+                    run_doctor()
+            except Exception as e:
+                buf.write(f"\n  [XX] health check failed: {e}\n")
+            self.ui(self.doctor_card, buf.getvalue())
+        threading.Thread(target=work, daemon=True).start()
+
+    def doctor_card(self, out):
+        t = Text()
+        marks = {"ok": ("✓", GREEN), "!!": ("!", YELLOW), "XX": ("✗", RED), "--": ("·", MUTED)}
+        for line in out.splitlines():
+            m = re.match(r"\s*\[(ok|!!|XX|--)\]\s*(.*?)\s{2,}(.*)$", line) or re.match(r"\s*\[(ok|!!|XX|--)\]\s*(.*)()$", line)
+            if m:
+                mark, col = marks[m.group(1)]
+                t.append(f"{mark} ", style=f"bold {col}")
+                t.append(f"{m.group(2):<24}", style=FG)
+                detail = m.group(3)
+                detail = detail if len(detail) <= 58 else detail[:57] + "…"
+                t.append(detail + "\n", style=MUTED if m.group(1) in ("ok", "--") else col)
+            elif line.strip() and "health check" not in line:
+                t.append(("\n" if t.plain else "") + line.strip() + "\n", style=f"bold {FG2}")
+        self.card("Health check", t, icon="✚")
+
+    def cmd_pull(self, arg):
+        name = arg.strip()
+        if not name:
+            self.notify("Usage: /pull llama3.2   ·   /pull qwen2.5-coder:7b   (models: ollama.com/library)",
+                        title="Download a model")
+            return
+        if getattr(self, "pulling", None):
+            self.notify(f"Already downloading {self.pulling} - wait for it to finish.", severity="warning")
+            return
+        self.pulling = name
+        line = Static(Text.assemble(("⇣ ", ACCENT), (f"Downloading {name}…", FG2)), classes="info")
+        self.add_widget(line, self.cur_tab)
+
+        def show(msg, style=FG2, icon="⇣ ", col=None):
+            line.update(Text.assemble((icon, col or ACCENT), (msg, style)))
+
+        def work():
+            last = 0
+            try:
+                r = http(self.cfg, "/api/pull", {"model": name, "stream": True}, timeout=3600)
+                with r:
+                    for raw in r:
+                        try:
+                            ev = json.loads(raw.decode("utf-8"))
+                        except Exception:
+                            continue
+                        if ev.get("error"):
+                            raise OllamaError(ev["error"])
+                        st = ev.get("status", "")
+                        if time.monotonic() - last < 0.25 and not st.startswith("success"):
+                            continue
+                        last = time.monotonic()
+                        if ev.get("total"):
+                            pct = (ev.get("completed") or 0) / ev["total"]
+                            bar = "█" * int(pct * 24) + "░" * (24 - int(pct * 24))
+                            msg = f"{name}  {bar}  {pct * 100:4.1f}%  ·  {(ev.get('completed') or 0) / 1e9:.2f} / {ev['total'] / 1e9:.2f} GB"
+                        else:
+                            msg = f"{name}  ·  {st}"
+                        self.ui(show, msg)
+                models = list_models(self.cfg)
+                self.ui(self.models_detected, models, None)
+                self.ui(show, f"{name} is ready. Pick it with ctrl+m or /model.", f"bold {GREEN}", "✓ ", GREEN)
+                self.ui(self.notify, f"{name} downloaded.", title="Models")
+            except OllamaError as e:
+                msg = str(e)
+                if "file does not exist" in msg or "not found" in msg:
+                    msg = f"there's no model called {name} - check the name at ollama.com/library"
+                self.ui(show, f"Couldn't download {name}: {msg}", RED, "✗ ", RED)
+            except Exception as e:
+                self.ui(show, f"Couldn't download {name}: {e}", RED, "✗ ", RED)
+            finally:
+                self.pulling = None
+        threading.Thread(target=work, daemon=True).start()
+
+    def cmd_retry(self):
+        tab = self.cur_tab
+        if tab.busy:
+            self.notify("Wait for this reply to finish (or press esc), then /retry.", severity="warning")
+            return
+        if not tab.turns:
+            self.notify("Nothing to retry yet.", timeout=3)
+            return
+        typed = (tab.turns[-1].get("restore") or ("", ""))[0]
+        before = len(tab.turns)
+        prompt = self.query_one("#prompt", Input)
+        draft = prompt.value
+        prompt.value = ""
+        self.undo_last()
+        if len(tab.turns) < before and typed:
+            prompt.value = draft
+            self.send_message(typed)
+        else:
+            prompt.value = draft or prompt.value
+
+    def cmd_instructions(self, arg):
+        a = arg.strip()
+        if a.lower() in ("clear", "off", "none", "reset"):
+            self.cfg["instructions"] = ""
+            save_settings(self.cfg)
+            self.notify("Standing instructions cleared.", title="Instructions")
+            return
+        if a:
+            self.cfg["instructions"] = a[:2000]
+            save_settings(self.cfg)
+            self.notify("Saved. ocode will follow this in every chat.", title="Instructions")
+            return
+
+        def got(v):
+            if v is not None:
+                self.cfg["instructions"] = v.strip()[:2000]
+                save_settings(self.cfg)
+                self.notify("Saved." if v.strip() else "Cleared.", title="Instructions", timeout=2)
+        self.push_screen(InputScreen("Instructions for every chat (e.g. \"answer briefly, use Python 3.12\")",
+                                     self.cfg.get("instructions", ""), select=False), got)
+
+    def cmd_temp(self, arg):
+        a = arg.strip()
+        if not a:
+            self.notify(f"Temperature is {self.cfg['temperature']} (0 = focused, 1 = creative). /temp 0.7 to change.",
+                        title="Temperature")
+            return
+        try:
+            v = float(a)
+            if not 0 <= v <= 2:
+                raise ValueError
+        except ValueError:
+            self.notify("Use a number from 0 to 2, like /temp 0.7", severity="warning")
+            return
+        self.cfg["temperature"] = v
+        save_settings(self.cfg)
+        self.notify(f"Temperature set to {v}.", title="Temperature", timeout=2)
+
+    def cmd_search(self, arg):
+        q = arg.strip()
+        if not q:
+            self.notify("Usage: /search <words> - searches all your saved chats.", title="Search")
+            return
+
+        def loader():
+            res = search_sessions(q)
+            return [(d["id"], (d.get("title") or "Untitled chat")[:40], f"{ago(d.get('updated'))}  ·  {snip[:70]}")
+                    for d, snip in res] or [("", f"No chats mention \"{q}\"", "")]
+
+        def chosen(sid):
+            if sid:
+                self.open_session(sid, note=f"found by /search {q}")
+            self.query_one("#prompt", Input).focus()
+        self.push_screen(ChoiceScreen(f"Chats mentioning \"{q[:30]}\"", loader, ""), chosen)
+
+    def open_todos(self):
+        def chosen(text):
+            if text:
+                prompt = self.query_one("#prompt", Input)
+                prompt.value = f"Help me with this to-do: {text}"
+                prompt.cursor_position = len(prompt.value)
+                prompt.focus()
+        self.push_screen(TodoScreen(), chosen)
+
+    def cmd_todo(self, arg):
+        a = arg.strip()
+        if not a:
+            self.open_todos()
+            return
+        items = load_todos()
+        word, _, rest = a.partition(" ")
+        if word.lower() in ("done", "undo") and rest.strip().isdigit():
+            i = int(rest) - 1
+            if 0 <= i < len(items):
+                items[i]["done"] = word.lower() == "done"
+                save_todos(items)
+                self.notify(("✓ " if items[i]["done"] else "○ ") + items[i]["text"][:60], title="To-do", timeout=2)
+            return
+        if word.lower() in ("list", "ls"):
+            open_ = [it for it in items if not it.get("done")]
+            self.card(f"To-do  ·  {len(open_)} left", Text("\n".join(
+                f"{n}. {'✓' if it.get('done') else '○'} {it['text']}" for n, it in enumerate(items, 1)) or "Nothing to do!"),
+                icon="☑")
+            return
+        if word.lower() == "add":
+            a = rest.strip()
+        items.append({"text": a[:200], "done": False, "added": time.time()})
+        save_todos(items)
+        self.notify(f"Added: {a[:60]}  ({plural(sum(1 for i in items if not i.get('done')), 'thing')} to do)",
+                    title="To-do", timeout=3)
 
     # ----- connections: MCP, Telegram, notifications -----
     def mcp_changed(self):
@@ -8771,6 +9303,32 @@ class OcodeApp(App):
             self.copy_last_reply()
         elif cmd == "/undo":
             self.undo_last()
+        elif cmd in ("/retry", "/regen", "/regenerate"):
+            self.cmd_retry()
+        elif cmd in ("/time", "/date", "/calendar", "/cal"):
+            self.cmd_time(arg)
+        elif cmd in ("/calc", "/math"):
+            self.cmd_calc(arg)
+        elif cmd in ("/timer", "/timers"):
+            self.cmd_timer(arg)
+        elif cmd in ("/roll", "/dice"):
+            self.cmd_roll(arg)
+        elif cmd in ("/flip", "/coin"):
+            self.cmd_flip()
+        elif cmd == "/weather":
+            self.cmd_weather(arg)
+        elif cmd in ("/doctor", "/health"):
+            self.cmd_doctor()
+        elif cmd in ("/pull", "/download"):
+            self.cmd_pull(arg)
+        elif cmd in ("/instructions", "/rules"):
+            self.cmd_instructions(arg)
+        elif cmd in ("/temp", "/temperature"):
+            self.cmd_temp(arg)
+        elif cmd in ("/search", "/find"):
+            self.cmd_search(arg)
+        elif cmd in ("/todo", "/todos"):
+            self.cmd_todo(arg)
         elif cmd == "/name":
             if arg.strip():
                 self.cfg["user_name"] = arg.strip()[:30]
@@ -9008,6 +9566,17 @@ class OcodeApp(App):
             ("cd", "Code & git", "Change working folder…", "", short_path(self.cwd)),
             ("auto", "Code & git", "Auto-approve edits", "", onoff(c["auto_approve"])),
             ("prompts", "Code & git", "Prompt commands…", "", f"{len(self.prompt_commands())} available"),
+            # Tools
+            ("time", "Tools", "Time & calendar", "", ""),
+            ("calc", "Tools", "Calculator…", "", ""),
+            ("timer", "Tools", "Set a timer…", "", f"{len(self.timers)} running" if self.timers else ""),
+            ("todo", "Tools", "To-do list…", "", f"{sum(1 for i in load_todos() if not i.get('done'))} left"),
+            ("weather", "Tools", "Weather", "", c.get("weather_place") or ""),
+            ("search", "Tools", "Search past chats…", "", ""),
+            ("doctor", "Tools", "Health check", "", ""),
+            ("pull", "Model & look", "Download a model…", "", ""),
+            ("retry", "Chat & tabs", "Retry last reply", "", ""),
+            ("instructions", "Chat & tabs", "Standing instructions…", "", "on" if c.get("instructions") else "off"),
             # Connections
             ("connections", "Connections", "All connections…", "", ""),
             ("mcp", "Connections", "MCP servers…", "", f"{len(mcp_connected())} connected"),
@@ -9050,6 +9619,27 @@ class OcodeApp(App):
                 self.update_ocode()
             elif cid == "connections":
                 self.open_connections()
+            elif cid == "time":
+                self.cmd_time()
+            elif cid in ("calc", "timer", "pull", "search", "weather") and not (cid == "weather" and self.cfg.get("weather_place")):
+                hints = {"calc": "Calculate (e.g. 12*(3+4))", "timer": "Timer length and name (e.g. 10m tea)",
+                         "pull": "Model to download (e.g. llama3.2)", "search": "Search your past chats for…",
+                         "weather": "Weather for which place? (e.g. Austin, TX)"}
+
+                def got(v, cid=cid):
+                    if v and v.strip():
+                        self.slash(f"/{cid} {v.strip()}")
+                self.push_screen(InputScreen(hints[cid], ""), got)
+            elif cid == "weather":
+                self.cmd_weather("")
+            elif cid == "todo":
+                self.open_todos()
+            elif cid == "doctor":
+                self.cmd_doctor()
+            elif cid == "retry":
+                self.cmd_retry()
+            elif cid == "instructions":
+                self.cmd_instructions("")
             elif cid == "mcp":
                 self.push_screen(McpScreen())
             elif cid == "telegram":
@@ -9619,6 +10209,209 @@ def run_doctor():
     print("\n" + ("Everything essential looks good. Type  ocode  to start." if essential_ok else
                   "Fix the [XX] items above, then run  ocode doctor  again.") + "\n")
     return 0 if essential_ok else 1
+
+
+# ---------------------------------------------------------------------------
+# Little tools behind the utility commands (/calc, /timer, /roll, /todo, /weather …)
+# ---------------------------------------------------------------------------
+class CalcError(Exception):
+    pass
+
+
+CALC_NAMES = {k: getattr(math, k) for k in ("sqrt", "sin", "cos", "tan", "asin", "acos", "atan", "log", "log10",
+                                            "log2", "exp", "floor", "ceil", "factorial", "radians", "degrees",
+                                            "hypot", "gcd")}
+CALC_NAMES.update({"pi": math.pi, "e": math.e, "tau": math.tau, "abs": abs, "round": round, "min": min, "max": max})
+
+
+def safe_calc(expr):
+    """Maths only - no names or calls other than the ones above, so it can't run code."""
+    expr = expr.strip().replace("^", "**").replace("×", "*").replace("÷", "/").replace(",", "")
+    pct = re.fullmatch(r"([\d.]+)\s*%\s*of\s*([\d.]+)", expr, re.I)
+    if pct:
+        expr = f"{pct.group(1)}/100*{pct.group(2)}"
+    try:
+        tree = ast.parse(expr, mode="eval")
+    except SyntaxError:
+        raise CalcError("that isn't a maths expression")
+
+    def ev(n):
+        if isinstance(n, ast.Expression):
+            return ev(n.body)
+        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
+            return n.value
+        if isinstance(n, ast.Name) and n.id in CALC_NAMES:
+            return CALC_NAMES[n.id]
+        if isinstance(n, ast.UnaryOp) and isinstance(n.op, (ast.UAdd, ast.USub)):
+            v = ev(n.operand)
+            return v if isinstance(n.op, ast.UAdd) else -v
+        if isinstance(n, ast.BinOp):
+            a, b = ev(n.left), ev(n.right)
+            if isinstance(n.op, ast.Pow) and (abs(b) > 1000 or abs(a) > 1e6 and b > 10):
+                raise CalcError("that number is too big")
+            ops = {ast.Add: lambda: a + b, ast.Sub: lambda: a - b, ast.Mult: lambda: a * b, ast.Div: lambda: a / b,
+                   ast.FloorDiv: lambda: a // b, ast.Mod: lambda: a % b, ast.Pow: lambda: a ** b}
+            f = ops.get(type(n.op))
+            if f:
+                return f()
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and callable(CALC_NAMES.get(n.func.id)) \
+                and not n.keywords:
+            args = [ev(a) for a in n.args]
+            if n.func.id == "factorial" and args and args[0] > 500:
+                raise CalcError("that number is too big")
+            return CALC_NAMES[n.func.id](*args)
+        raise CalcError("only numbers, + - * / ^ % ( ) and maths functions like sqrt() are allowed")
+
+    try:
+        v = ev(tree)
+    except ZeroDivisionError:
+        raise CalcError("can't divide by zero")
+    except (ValueError, OverflowError, TypeError) as e:
+        raise CalcError(str(e))
+    if isinstance(v, float) and v.is_integer() and abs(v) < 1e15:
+        v = int(v)
+    return v
+
+
+def fmt_number(v):
+    if isinstance(v, int):
+        return f"{v:,}"
+    return f"{v:,.10g}"
+
+
+def parse_duration(text):
+    """'5m', '1h30m', '90s', '2 min', '10' (minutes) -> seconds, or None."""
+    t = text.strip().lower().replace(" ", "")
+    if re.fullmatch(r"\d+(\.\d+)?", t):
+        return int(float(t) * 60)
+    total, pos = 0.0, 0
+    for m in re.finditer(r"(\d+(?:\.\d+)?)(hours?|hrs|hr|h|minutes?|mins|min|m|seconds?|secs|sec|s)", t):
+        if m.start() != pos:
+            return None
+        n, unit = float(m.group(1)), m.group(2)[0]
+        total += n * {"h": 3600, "m": 60, "s": 1}[unit]
+        pos = m.end()
+    if pos != len(t) or total <= 0:
+        return None
+    return int(total)
+
+
+def roll_dice(spec="1d6"):
+    """'2d6', 'd20', '3d6+2' -> (total, rolls, modifier)."""
+    m = re.fullmatch(r"\s*(\d*)\s*d\s*(\d+)\s*([+-]\s*\d+)?\s*", spec.lower() or "1d6")
+    if not m:
+        raise ValueError("use something like 2d6, d20 or 3d6+2")
+    n, sides = int(m.group(1) or 1), int(m.group(2))
+    mod = int((m.group(3) or "0").replace(" ", ""))
+    if not (1 <= n <= 100 and 2 <= sides <= 1000):
+        raise ValueError("1-100 dice with 2-1000 sides")
+    rolls = [secrets.randbelow(sides) + 1 for _ in range(n)]
+    return sum(rolls) + mod, rolls, mod
+
+
+def load_todos():
+    try:
+        items = json.loads(TODO_FILE.read_text(encoding="utf-8")).get("items", [])
+        return [i for i in items if isinstance(i, dict) and i.get("text")]
+    except Exception:
+        return []
+
+
+def save_todos(items):
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        TODO_FILE.write_text(json.dumps({"items": items}, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+WEATHER_CODES = {0: ("Clear", "☀"), 1: ("Mostly clear", "🌤"), 2: ("Partly cloudy", "⛅"), 3: ("Cloudy", "☁"),
+                 45: ("Fog", "🌫"), 48: ("Freezing fog", "🌫"), 51: ("Light drizzle", "🌦"), 53: ("Drizzle", "🌦"),
+                 55: ("Heavy drizzle", "🌧"), 56: ("Freezing drizzle", "🌧"), 57: ("Freezing drizzle", "🌧"),
+                 61: ("Light rain", "🌦"), 63: ("Rain", "🌧"), 65: ("Heavy rain", "🌧"), 66: ("Freezing rain", "🌧"),
+                 67: ("Freezing rain", "🌧"), 71: ("Light snow", "🌨"), 73: ("Snow", "🌨"), 75: ("Heavy snow", "❄"),
+                 77: ("Snow grains", "🌨"), 80: ("Showers", "🌦"), 81: ("Showers", "🌧"), 82: ("Violent showers", "⛈"),
+                 85: ("Snow showers", "🌨"), 86: ("Snow showers", "❄"), 95: ("Thunderstorm", "⛈"),
+                 96: ("Thunderstorm, hail", "⛈"), 99: ("Thunderstorm, hail", "⛈")}
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+
+
+def get_json(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": f"ocode/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def fetch_weather(place):
+    """Free weather from Open-Meteo (no key). Returns a dict for weather_card()."""
+    name = place.strip()
+    region = ""
+    if "," in name:  # "Austin, TX" -> look up Austin, prefer results in TX
+        name, region = [x.strip() for x in name.split(",", 1)]
+    geo = get_json(f"{GEOCODE_URL}?name={urllib.parse.quote(name)}&count=10&language=en&format=json")
+    hits = geo.get("results") or []
+    if not hits:
+        raise ValueError(f"couldn't find a place called \"{place}\"")
+    if region:
+        r = region.lower()
+        hits = sorted(hits, key=lambda h: not any(r in (h.get(k) or "").lower() or (h.get(k) or "").lower() == r
+                                                  for k in ("admin1", "country", "country_code")) and
+                      US_STATES.get(region.upper(), "~").lower() != (h.get("admin1") or "").lower())
+    h = hits[0]
+    us = h.get("country_code") == "US"
+    units = "&temperature_unit=fahrenheit&wind_speed_unit=mph&precipitation_unit=inch" if us else ""
+    fc = get_json(f"{FORECAST_URL}?latitude={h['latitude']}&longitude={h['longitude']}&timezone=auto{units}"
+                  "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m"
+                  "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max&forecast_days=4")
+    label = ", ".join(x for x in (h.get("name"), h.get("admin1"), h.get("country_code") if not us else "") if x)
+    return {"place": label, "us": us, "current": fc.get("current") or {}, "daily": fc.get("daily") or {}}
+
+
+US_STATES = {"AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas", "CA": "California", "CO": "Colorado",
+             "CT": "Connecticut", "DE": "Delaware", "FL": "Florida", "GA": "Georgia", "HI": "Hawaii", "ID": "Idaho",
+             "IL": "Illinois", "IN": "Indiana", "IA": "Iowa", "KS": "Kansas", "KY": "Kentucky", "LA": "Louisiana",
+             "ME": "Maine", "MD": "Maryland", "MA": "Massachusetts", "MI": "Michigan", "MN": "Minnesota",
+             "MS": "Mississippi", "MO": "Missouri", "MT": "Montana", "NE": "Nebraska", "NV": "Nevada",
+             "NH": "New Hampshire", "NJ": "New Jersey", "NM": "New Mexico", "NY": "New York", "NC": "North Carolina",
+             "ND": "North Dakota", "OH": "Ohio", "OK": "Oklahoma", "OR": "Oregon", "PA": "Pennsylvania",
+             "RI": "Rhode Island", "SC": "South Carolina", "SD": "South Dakota", "TN": "Tennessee", "TX": "Texas",
+             "UT": "Utah", "VT": "Vermont", "VA": "Virginia", "WA": "Washington", "WV": "West Virginia",
+             "WI": "Wisconsin", "WY": "Wyoming", "DC": "District of Columbia"}
+
+
+def search_sessions(query, limit=40):
+    """Search every saved chat for some words. Returns [(session, snippet)] best first."""
+    words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 1]
+    if not words:
+        return []
+    out = []
+    try:
+        files = list(SESSIONS_DIR.glob("*.json"))
+    except OSError:
+        return []
+    for f in files:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        best, snippet = 0, ""
+        title = (d.get("title") or "").lower()
+        for m in d.get("history", []):
+            if m.get("role") not in ("user", "assistant"):
+                continue
+            text = visible_text(m.get("content", ""), True) if m["role"] == "assistant" else m.get("content", "")
+            low = text.lower()
+            score = sum(low.count(w) for w in words) + (5 if query.lower() in low else 0)
+            if score > best and all(w in low or w in title for w in words):
+                best = score
+                i = min((low.find(w) for w in words if w in low), default=0)
+                start = max(0, i - 40)
+                snippet = ("…" if start else "") + " ".join(text[start:start + 110].split())
+        if best or all(w in title for w in words):
+            out.append((best + (10 if all(w in title for w in words) else 0), d, snippet))
+    out.sort(key=lambda x: (-x[0], -(x[1].get("updated") or 0)))
+    return [(d, snip) for _, d, snip in out[:limit]]
 
 
 # ---------------------------------------------------------------------------
